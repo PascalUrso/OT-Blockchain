@@ -1,4 +1,4 @@
-# ot-collab-java
+# OT-Blockchain
 
 A research prototype for **blockchain-backed collaborative text editing** using **Operational Transformation (OT)** on [Hyperledger Fabric](https://www.hyperledger.org/projects/fabric).
 
