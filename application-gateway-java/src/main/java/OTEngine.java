@@ -71,6 +71,9 @@ public final class OTEngine {
         }
 
         if (op1.getType() == OperationType.update && op2.getType() == OperationType.update) {
+            if(p1 == p2 && op1.getClientId().compareTo(op2.getClientId()) < 0){
+                return toNoop(op1);
+            }
             return op1;
         }
 

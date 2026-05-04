@@ -19,52 +19,112 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.InvalidKeyException;
 import java.security.cert.CertificateException;
+import java.util.Objects;
 
 public final class Connections {
-    // Path to crypto materials.
-    private static final Path cryptoPath = Paths.get("..", "..", "test-network", "organizations", "peerOrganizations",	"org1.example.com");
-    // Path to user certificate.
-    private static final Path certDirPath = cryptoPath.resolve(Paths.get("users", "User1@org1.example.com", "msp", "signcerts"));
-    // Path to user private key directory.
-    private static final Path keyDirPath = cryptoPath.resolve(Paths.get("users", "User1@org1.example.com", "msp", "keystore"));
-    // Path to peer tls certificate.
-    private static final Path tlsCertPath = cryptoPath.resolve(Paths.get("peers", "peer0.org1.example.com", "tls", "ca.crt"));
+    public static final class GatewayProfile {
+        private final String mspId;
+        private final Path certDirPath;
+        private final Path keyDirPath;
+        private final Path tlsCertPath;
+        private final String peerEndpoint;
+        private final String overrideAuth;
 
-    // Gateway peer end point.
-    private static final String peerEndpoint = "localhost:7051";
-    private static final String overrideAuth = "peer0.org1.example.com";
+        public GatewayProfile(final String mspId,
+                              final Path certDirPath,
+                              final Path keyDirPath,
+                              final Path tlsCertPath,
+                              final String peerEndpoint,
+                              final String overrideAuth) {
+            this.mspId = Objects.requireNonNull(mspId, "mspId is required");
+            this.certDirPath = Objects.requireNonNull(certDirPath, "certDirPath is required");
+            this.keyDirPath = Objects.requireNonNull(keyDirPath, "keyDirPath is required");
+            this.tlsCertPath = Objects.requireNonNull(tlsCertPath, "tlsCertPath is required");
+            this.peerEndpoint = Objects.requireNonNull(peerEndpoint, "peerEndpoint is required");
+            this.overrideAuth = Objects.requireNonNull(overrideAuth, "overrideAuth is required");
+        }
 
-    private static final String mspID = "Org1MSP";
+        public String getMspId() {
+            return mspId;
+        }
+
+        public Path getCertDirPath() {
+            return certDirPath;
+        }
+
+        public Path getKeyDirPath() {
+            return keyDirPath;
+        }
+
+        public Path getTlsCertPath() {
+            return tlsCertPath;
+        }
+
+        public String getPeerEndpoint() {
+            return peerEndpoint;
+        }
+
+        public String getOverrideAuth() {
+            return overrideAuth;
+        }
+    }
 
     private Connections() {
         // Private constructor to prevent instantiation
     }
 
-    public static ManagedChannel newGrpcConnection() throws IOException {
+    public static GatewayProfile defaultProfile() {
+        Path cryptoPath = Paths.get("..", "..", "test-network", "organizations", "peerOrganizations", "org1.example.com");
+        Path certDirPath = cryptoPath.resolve(Paths.get("users", "User1@org1.example.com", "msp", "signcerts"));
+        Path keyDirPath = cryptoPath.resolve(Paths.get("users", "User1@org1.example.com", "msp", "keystore"));
+        Path tlsCertPath = cryptoPath.resolve(Paths.get("peers", "peer0.org1.example.com", "tls", "ca.crt"));
+        return new GatewayProfile(
+                "Org1MSP",
+                certDirPath,
+                keyDirPath,
+                tlsCertPath,
+                "localhost:7051",
+                "peer0.org1.example.com");
+    }
+
+    public static ManagedChannel newGrpcConnection(final GatewayProfile profile) throws IOException {
         var credentials = TlsChannelCredentials.newBuilder()
-                .trustManager(tlsCertPath.toFile())
+                .trustManager(profile.tlsCertPath.toFile())
                 .build();
-        return Grpc.newChannelBuilder(peerEndpoint, credentials)
-                .overrideAuthority(overrideAuth)
+        return Grpc.newChannelBuilder(profile.peerEndpoint, credentials)
+                .overrideAuthority(profile.overrideAuth)
                 .build();
     }
 
-    public static Identity newIdentity() throws IOException, CertificateException {
-        try (var certReader = Files.newBufferedReader(getFirstFilePath(certDirPath))) {
+    public static ManagedChannel newGrpcConnection() throws IOException {
+        return newGrpcConnection(defaultProfile());
+    }
+
+    public static Identity newIdentity(final GatewayProfile profile) throws IOException, CertificateException {
+        try (var certReader = Files.newBufferedReader(getFirstFilePath(profile.certDirPath))) {
             var certificate = Identities.readX509Certificate(certReader);
-            return new X509Identity(mspID, certificate);
+            return new X509Identity(profile.mspId, certificate);
+        }
+    }
+
+    public static Identity newIdentity() throws IOException, CertificateException {
+        return newIdentity(defaultProfile());
+    }
+
+    public static Signer newSigner(final GatewayProfile profile) throws IOException, InvalidKeyException {
+        try (var keyReader = Files.newBufferedReader(getFirstFilePath(profile.keyDirPath))) {
+            var privateKey = Identities.readPrivateKey(keyReader);
+            return Signers.newPrivateKeySigner(privateKey);
         }
     }
 
     public static Signer newSigner() throws IOException, InvalidKeyException {
-        try (var keyReader = Files.newBufferedReader(getFirstFilePath(keyDirPath))) {
-            var privateKey = Identities.readPrivateKey(keyReader);
-            return Signers.newPrivateKeySigner(privateKey);
-        }
+        return newSigner(defaultProfile());
     }
 
     private static Path getFirstFilePath(Path dirPath) throws IOException {
         try (var keyFiles = Files.list(dirPath)) {
             return keyFiles.findFirst().orElseThrow();
         }
-    }}
+    }
+}
