@@ -6,11 +6,11 @@ package org.hyperledger.fabric.samples.assettransfer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.ThrowableAssert.catchThrowable;
-import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -22,284 +22,305 @@ import org.hyperledger.fabric.shim.ledger.KeyValue;
 import org.hyperledger.fabric.shim.ledger.QueryResultsIterator;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
-import org.mockito.InOrder;
+import org.mockito.ArgumentMatchers;
+
+import com.owlike.genson.Genson;
 
 public final class AssetTransferTest {
 
-    private static final class MockKeyValue implements KeyValue {
+    // -------------------------------------------------------------------------
+    // Test doubles
+    // -------------------------------------------------------------------------
 
+    private static final class MockKeyValue implements KeyValue {
         private final String key;
         private final String value;
 
         MockKeyValue(final String key, final String value) {
-            super();
             this.key = key;
             this.value = value;
         }
 
         @Override
         public String getKey() {
-            return this.key;
+            return key;
         }
 
         @Override
         public String getStringValue() {
-            return this.value;
+            return value;
         }
 
         @Override
         public byte[] getValue() {
-            return this.value.getBytes();
+            return value.getBytes();
         }
-
     }
 
-    private static final class MockAssetResultsIterator implements QueryResultsIterator<KeyValue> {
+    private static final class MockQueryResultsIterator implements QueryResultsIterator<KeyValue> {
+        private final List<KeyValue> items;
 
-        private final List<KeyValue> assetList;
-
-        MockAssetResultsIterator() {
-            super();
-
-            assetList = new ArrayList<KeyValue>();
-
-            assetList.add(new MockKeyValue("asset1",
-                    "{ \"assetID\": \"asset1\", \"color\": \"blue\", \"size\": 5, \"owner\": \"Tomoko\", \"appraisedValue\": 300 }"));
-            assetList.add(new MockKeyValue("asset2",
-                    "{ \"assetID\": \"asset2\", \"color\": \"red\", \"size\": 5,\"owner\": \"Brad\", \"appraisedValue\": 400 }"));
-            assetList.add(new MockKeyValue("asset3",
-                    "{ \"assetID\": \"asset3\", \"color\": \"green\", \"size\": 10,\"owner\": \"Jin Soo\", \"appraisedValue\": 500 }"));
-            assetList.add(new MockKeyValue("asset4",
-                    "{ \"assetID\": \"asset4\", \"color\": \"yellow\", \"size\": 10,\"owner\": \"Max\", \"appraisedValue\": 600 }"));
-            assetList.add(new MockKeyValue("asset5",
-                    "{ \"assetID\": \"asset5\", \"color\": \"black\", \"size\": 15,\"owner\": \"Adrian\", \"appraisedValue\": 700 }"));
-            assetList.add(new MockKeyValue("asset6",
-                    "{ \"assetID\": \"asset6\", \"color\": \"white\", \"size\": 15,\"owner\": \"Michel\", \"appraisedValue\": 800 }"));
+        MockQueryResultsIterator(final List<KeyValue> items) {
+            this.items = items;
         }
 
         @Override
         public Iterator<KeyValue> iterator() {
-            return assetList.iterator();
+            return items.iterator();
         }
 
         @Override
         public void close() {
-            // do nothing
+            // no-op
         }
-
     }
 
-    @Test
-    public void invokeUnknownTransaction() {
-        AssetTransfer contract = new AssetTransfer();
-        Context ctx = mock(Context.class);
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
 
-        Throwable thrown = catchThrowable(() -> {
-            contract.unknownTransaction(ctx);
-        });
+    private static final Genson GENSON = new Genson();
 
-        assertThat(thrown).isInstanceOf(ChaincodeException.class).hasNoCause()
-                .hasMessage("Undefined contract method called");
-        assertThat(((ChaincodeException) thrown).getPayload()).isEqualTo(null);
+    /** Existing doc marker — any non-empty string is enough for the chaincode exists() check. */
+    private static final String DOC_EXISTS = "{\"content\":\"\",\"docId\":\"doc1\",\"version\":0}";
 
-        verifyNoInteractions(ctx);
+    /** Serialises an Operation to JSON using the same Genson instance as the chaincode. */
+    private static String opJson(final String opId, final String clientId,
+                                  final OperationType type, final int pos,
+                                  final String value, final long ack) {
+        Operation op = new Operation(opId, clientId, type, pos, value, 1_000L, ack);
+        return GENSON.serialize(op);
     }
+
+    // -------------------------------------------------------------------------
+    // InitDoc
+    // -------------------------------------------------------------------------
 
     @Nested
-    class InvokeReadAssetTransaction {
+    class InitDocTransaction {
 
         @Test
-        public void whenAssetExists() {
+        public void createsDocumentSuccessfully() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1"))
-                    .thenReturn("{ \"assetID\": \"asset1\", \"color\": \"blue\", \"size\": 5, \"owner\": \"Tomoko\", \"appraisedValue\": 300 }");
+            when(stub.getStringState("SNAP::doc1")).thenReturn("");
 
-            Asset asset = contract.ReadAsset(ctx, "asset1");
+            Asset result = contract.InitDoc(ctx, "doc1", "");
 
-            assertThat(asset).isEqualTo(new Asset("asset1", "blue", 5, "Tomoko", 300));
+            assertThat(result.getDocId()).isEqualTo("doc1");
+            assertThat(result.getContent()).isEqualTo("");
+            assertThat(result.getVersion()).isEqualTo(0);
+            verify(stub).putStringState(ArgumentMatchers.eq("SNAP::doc1"), ArgumentMatchers.anyString());
         }
 
         @Test
-        public void whenAssetDoesNotExist() {
+        public void throwsWhenDocumentAlreadyExists() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1")).thenReturn("");
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
 
-            Throwable thrown = catchThrowable(() -> {
-                contract.ReadAsset(ctx, "asset1");
-            });
+            Throwable thrown = catchThrowable(() -> contract.InitDoc(ctx, "doc1", ""));
 
-            assertThat(thrown).isInstanceOf(ChaincodeException.class).hasNoCause()
-                    .hasMessage("Asset asset1 does not exist");
-            assertThat(((ChaincodeException) thrown).getPayload()).isEqualTo("ASSET_NOT_FOUND".getBytes());
+            assertThat(thrown)
+                    .isInstanceOf(ChaincodeException.class)
+                    .hasMessageContaining("doc1");
         }
     }
 
-    @Test
-    void invokeInitLedgerTransaction() {
-        AssetTransfer contract = new AssetTransfer();
-        Context ctx = mock(Context.class);
-        ChaincodeStub stub = mock(ChaincodeStub.class);
-        when(ctx.getStub()).thenReturn(stub);
-
-        contract.InitLedger(ctx);
-
-        InOrder inOrder = inOrder(stub);
-        inOrder.verify(stub).putStringState("asset1", "{\"appraisedValue\":300,\"assetID\":\"asset1\",\"color\":\"blue\",\"owner\":\"Tomoko\",\"size\":5}");
-        inOrder.verify(stub).putStringState("asset2", "{\"appraisedValue\":400,\"assetID\":\"asset2\",\"color\":\"red\",\"owner\":\"Brad\",\"size\":5}");
-        inOrder.verify(stub).putStringState("asset3", "{\"appraisedValue\":500,\"assetID\":\"asset3\",\"color\":\"green\",\"owner\":\"Jin Soo\",\"size\":10}");
-        inOrder.verify(stub).putStringState("asset4", "{\"appraisedValue\":600,\"assetID\":\"asset4\",\"color\":\"yellow\",\"owner\":\"Max\",\"size\":10}");
-        inOrder.verify(stub).putStringState("asset5", "{\"appraisedValue\":700,\"assetID\":\"asset5\",\"color\":\"black\",\"owner\":\"Adrian\",\"size\":15}");
-
-    }
+    // -------------------------------------------------------------------------
+    // SubmitOp
+    // -------------------------------------------------------------------------
 
     @Nested
-    class InvokeCreateAssetTransaction {
+    class SubmitOpTransaction {
 
         @Test
-        public void whenAssetExists() {
+        public void throwsWhenDocumentDoesNotExist() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1"))
-                    .thenReturn("{ \"assetID\": \"asset1\", \"color\": \"blue\", \"size\": 5, \"owner\": \"Tomoko\", \"appraisedValue\": 300 }");
+            when(stub.getStringState("SNAP::doc1")).thenReturn("");
 
-            Throwable thrown = catchThrowable(() -> {
-                contract.CreateAsset(ctx, "asset1", "blue", 45, "Siobhán", 60);
-            });
+            Throwable thrown = catchThrowable(() ->
+                    contract.SubmitOp(ctx, "doc1", opJson("op-1", "userA", OperationType.insert, 0, "a", 0)));
 
-            assertThat(thrown).isInstanceOf(ChaincodeException.class).hasNoCause()
-                    .hasMessage("Asset asset1 already exists");
-            assertThat(((ChaincodeException) thrown).getPayload()).isEqualTo("ASSET_ALREADY_EXISTS".getBytes());
+            assertThat(thrown)
+                    .isInstanceOf(ChaincodeException.class)
+                    .hasMessageContaining("doc1");
         }
 
         @Test
-        public void whenAssetDoesNotExist() {
+        public void throwsWhenOpIdIsMissing() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1")).thenReturn("");
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
 
-            Asset asset = contract.CreateAsset(ctx, "asset1", "blue", 45, "Siobhán", 60);
+            // opId is blank
+            Throwable thrown = catchThrowable(() ->
+                    contract.SubmitOp(ctx, "doc1", opJson("", "userA", OperationType.insert, 0, "a", 0)));
 
-            assertThat(asset).isEqualTo(new Asset("asset1", "blue", 45, "Siobhán", 60));
+            assertThat(thrown).isInstanceOf(ChaincodeException.class);
+        }
+
+        @Test
+        public void throwsWhenTypeIsMissing() {
+            AssetTransfer contract = new AssetTransfer();
+            Context ctx = mock(Context.class);
+            ChaincodeStub stub = mock(ChaincodeStub.class);
+            when(ctx.getStub()).thenReturn(stub);
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
+
+            // no "type" field → type will be null after deserialization
+            String json = "{\"opId\":\"op-1\",\"clientId\":\"userA\",\"position\":0,\"value\":\"a\",\"timestamp\":1000,\"ack\":0}";
+
+            Throwable thrown = catchThrowable(() -> contract.SubmitOp(ctx, "doc1", json));
+
+            assertThat(thrown).isInstanceOf(ChaincodeException.class);
+        }
+
+        @Test
+        public void appendsOperationRecordToLedger() {
+            AssetTransfer contract = new AssetTransfer();
+            Context ctx = mock(Context.class);
+            ChaincodeStub stub = mock(ChaincodeStub.class);
+            when(ctx.getStub()).thenReturn(stub);
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
+            when(stub.getTxTimestamp()).thenReturn(Instant.ofEpochSecond(1_000_000));
+            when(stub.getTxId()).thenReturn("tx-abc");
+
+            OperationRecord record = contract.SubmitOp(ctx, "doc1",
+                    opJson("op-1", "userA", OperationType.insert, 0, "a", 0));
+
+            assertThat(record.getOperation().getOpId()).isEqualTo("op-1");
+            assertThat(record.getOperation().getClientId()).isEqualTo("userA");
+            assertThat(record.getTxId()).isEqualTo("tx-abc");
+            // A log entry must have been written under a key that starts with LOG::doc1
+            verify(stub).putStringState(
+                    ArgumentMatchers.contains("LOG::doc1"),
+                    ArgumentMatchers.anyString());
         }
     }
 
-    @Test
-    void invokeGetAllAssetsTransaction() {
-        AssetTransfer contract = new AssetTransfer();
-        Context ctx = mock(Context.class);
-        ChaincodeStub stub = mock(ChaincodeStub.class);
-        when(ctx.getStub()).thenReturn(stub);
-        when(stub.getStateByRange("", "")).thenReturn(new MockAssetResultsIterator());
-
-        String assets = contract.GetAllAssets(ctx);
-
-        assertThat(assets).isEqualTo("[{\"appraisedValue\":300,\"assetID\":\"asset1\",\"color\":\"blue\",\"owner\":\"Tomoko\",\"size\":5},"
-                + "{\"appraisedValue\":400,\"assetID\":\"asset2\",\"color\":\"red\",\"owner\":\"Brad\",\"size\":5},"
-                + "{\"appraisedValue\":500,\"assetID\":\"asset3\",\"color\":\"green\",\"owner\":\"Jin Soo\",\"size\":10},"
-                + "{\"appraisedValue\":600,\"assetID\":\"asset4\",\"color\":\"yellow\",\"owner\":\"Max\",\"size\":10},"
-                + "{\"appraisedValue\":700,\"assetID\":\"asset5\",\"color\":\"black\",\"owner\":\"Adrian\",\"size\":15},"
-                + "{\"appraisedValue\":800,\"assetID\":\"asset6\",\"color\":\"white\",\"owner\":\"Michel\",\"size\":15}]");
-
-    }
+    // -------------------------------------------------------------------------
+    // QueryAllOps
+    // -------------------------------------------------------------------------
 
     @Nested
-    class TransferAssetTransaction {
+    class QueryAllOpsTransaction {
 
         @Test
-        public void whenAssetExists() {
+        public void throwsWhenDocumentDoesNotExist() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1"))
-                    .thenReturn("{ \"assetID\": \"asset1\", \"color\": \"blue\", \"size\": 5, \"owner\": \"Tomoko\", \"appraisedValue\": 300 }");
+            when(stub.getStringState("SNAP::doc1")).thenReturn("");
 
-            String oldOwner = contract.TransferAsset(ctx, "asset1", "Dr Evil");
+            Throwable thrown = catchThrowable(() -> contract.QueryAllOps(ctx, "doc1"));
 
-            assertThat(oldOwner).isEqualTo("Tomoko");
+            assertThat(thrown)
+                    .isInstanceOf(ChaincodeException.class)
+                    .hasMessageContaining("doc1");
         }
 
         @Test
-        public void whenAssetDoesNotExist() {
+        public void returnsEmptyArrayWhenNoOpsCommitted() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1")).thenReturn("");
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
+            when(stub.getStateByRange("LOG::doc1::", "LOG::doc1::￿"))
+                    .thenReturn(new MockQueryResultsIterator(new ArrayList<>()));
 
-            Throwable thrown = catchThrowable(() -> {
-                contract.TransferAsset(ctx, "asset1", "Dr Evil");
-            });
+            String result = contract.QueryAllOps(ctx, "doc1");
 
-            assertThat(thrown).isInstanceOf(ChaincodeException.class).hasNoCause()
-                    .hasMessage("Asset asset1 does not exist");
-            assertThat(((ChaincodeException) thrown).getPayload()).isEqualTo("ASSET_NOT_FOUND".getBytes());
-        }
-    }
-
-    @Nested
-    class UpdateAssetTransaction {
-
-        @Test
-        public void whenAssetExists() {
-            AssetTransfer contract = new AssetTransfer();
-            Context ctx = mock(Context.class);
-            ChaincodeStub stub = mock(ChaincodeStub.class);
-            when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1"))
-                    .thenReturn("{ \"assetID\": \"asset1\", \"color\": \"blue\", \"size\": 45, \"owner\": \"Arturo\", \"appraisedValue\": 60 }");
-
-            Asset asset = contract.UpdateAsset(ctx, "asset1", "pink", 45, "Arturo", 600);
-
-            assertThat(asset).isEqualTo(new Asset("asset1", "pink", 45, "Arturo", 600));
+            assertThat(result).isEqualTo("[]");
         }
 
         @Test
-        public void whenAssetDoesNotExist() {
+        public void returnsSerializedOps() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1")).thenReturn("");
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
 
-            Throwable thrown = catchThrowable(() -> {
-                contract.TransferAsset(ctx, "asset1", "Alex");
-            });
+            Operation op = new Operation("op-1", "userA", OperationType.insert, 0, "a", 1000L, 0);
+            OperationRecord record = new OperationRecord(op, 1_000_000_000_000L, "tx-abc");
+            String recordJson = GENSON.serialize(record);
 
-            assertThat(thrown).isInstanceOf(ChaincodeException.class).hasNoCause()
-                    .hasMessage("Asset asset1 does not exist");
-            assertThat(((ChaincodeException) thrown).getPayload()).isEqualTo("ASSET_NOT_FOUND".getBytes());
+            List<KeyValue> items = new ArrayList<>();
+            items.add(new MockKeyValue("LOG::doc1::00001000000000000000000::tx-abc::op-1", recordJson));
+            when(stub.getStateByRange("LOG::doc1::", "LOG::doc1::￿"))
+                    .thenReturn(new MockQueryResultsIterator(items));
+
+            String result = contract.QueryAllOps(ctx, "doc1");
+
+            assertThat(result).contains("op-1").contains("userA");
         }
     }
 
+    // -------------------------------------------------------------------------
+    // QueryOpsAfter
+    // -------------------------------------------------------------------------
+
     @Nested
-    class DeleteAssetTransaction {
+    class QueryOpsAfterTransaction {
 
         @Test
-        public void whenAssetDoesNotExist() {
+        public void throwsWhenDocumentDoesNotExist() {
             AssetTransfer contract = new AssetTransfer();
             Context ctx = mock(Context.class);
             ChaincodeStub stub = mock(ChaincodeStub.class);
             when(ctx.getStub()).thenReturn(stub);
-            when(stub.getStringState("asset1")).thenReturn("");
+            when(stub.getStringState("SNAP::doc1")).thenReturn("");
 
-            Throwable thrown = catchThrowable(() -> {
-                contract.DeleteAsset(ctx, "asset1");
-            });
+            Throwable thrown = catchThrowable(() -> contract.QueryOpsAfter(ctx, "doc1", ""));
 
-            assertThat(thrown).isInstanceOf(ChaincodeException.class).hasNoCause()
-                    .hasMessage("Asset asset1 does not exist");
-            assertThat(((ChaincodeException) thrown).getPayload()).isEqualTo("ASSET_NOT_FOUND".getBytes());
+            assertThat(thrown)
+                    .isInstanceOf(ChaincodeException.class)
+                    .hasMessageContaining("doc1");
+        }
+
+        @Test
+        public void withEmptyCursorStartsFromBeginning() {
+            AssetTransfer contract = new AssetTransfer();
+            Context ctx = mock(Context.class);
+            ChaincodeStub stub = mock(ChaincodeStub.class);
+            when(ctx.getStub()).thenReturn(stub);
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
+            when(stub.getStateByRange("LOG::doc1::", "LOG::doc1::￿"))
+                    .thenReturn(new MockQueryResultsIterator(new ArrayList<>()));
+
+            String result = contract.QueryOpsAfter(ctx, "doc1", "");
+
+            assertThat(result).isEqualTo("[]");
+        }
+
+        @Test
+        public void withCursorStartsExclusivelyAfterKey() {
+            AssetTransfer contract = new AssetTransfer();
+            Context ctx = mock(Context.class);
+            ChaincodeStub stub = mock(ChaincodeStub.class);
+            when(ctx.getStub()).thenReturn(stub);
+            when(stub.getStringState("SNAP::doc1")).thenReturn(DOC_EXISTS);
+
+            String cursor = "LOG::doc1::00001000000000000000000::tx-abc::op-1";
+            // The chaincode appends " " to make the range start exclusive.
+            when(stub.getStateByRange(cursor + " ", "LOG::doc1::￿"))
+                    .thenReturn(new MockQueryResultsIterator(new ArrayList<>()));
+
+            String result = contract.QueryOpsAfter(ctx, "doc1", cursor);
+
+            assertThat(result).isEqualTo("[]");
         }
     }
 }

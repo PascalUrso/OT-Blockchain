@@ -16,59 +16,90 @@ public final class AssetTest {
 
         @Test
         public void isReflexive() {
-            Asset asset = new Asset("asset1", "Blue", 20, "Guy", 100);
-
+            Asset asset = new Asset("doc1", "hello", 3);
             assertThat(asset).isEqualTo(asset);
         }
 
         @Test
         public void isSymmetric() {
-            Asset assetA = new Asset("asset1", "Blue", 20, "Guy", 100);
-            Asset assetB = new Asset("asset1", "Blue", 20, "Guy", 100);
-
-            assertThat(assetA).isEqualTo(assetB);
-            assertThat(assetB).isEqualTo(assetA);
+            Asset a = new Asset("doc1", "hello", 3);
+            Asset b = new Asset("doc1", "hello", 3);
+            assertThat(a).isEqualTo(b);
+            assertThat(b).isEqualTo(a);
         }
 
         @Test
         public void isTransitive() {
-            Asset assetA = new Asset("asset1", "Blue", 20, "Guy", 100);
-            Asset assetB = new Asset("asset1", "Blue", 20, "Guy", 100);
-            Asset assetC = new Asset("asset1", "Blue", 20, "Guy", 100);
-
-            assertThat(assetA).isEqualTo(assetB);
-            assertThat(assetB).isEqualTo(assetC);
-            assertThat(assetA).isEqualTo(assetC);
+            Asset a = new Asset("doc1", "hello", 3);
+            Asset b = new Asset("doc1", "hello", 3);
+            Asset c = new Asset("doc1", "hello", 3);
+            assertThat(a).isEqualTo(b);
+            assertThat(b).isEqualTo(c);
+            assertThat(a).isEqualTo(c);
         }
 
         @Test
-        public void handlesInequality() {
-            Asset assetA = new Asset("asset1", "Blue", 20, "Guy", 100);
-            Asset assetB = new Asset("asset2", "Red", 40, "Lady", 200);
+        public void differentDocIdIsNotEqual() {
+            Asset a = new Asset("doc1", "hello", 3);
+            Asset b = new Asset("doc2", "hello", 3);
+            assertThat(a).isNotEqualTo(b);
+        }
 
-            assertThat(assetA).isNotEqualTo(assetB);
+        @Test
+        public void differentContentIsNotEqual() {
+            Asset a = new Asset("doc1", "hello", 3);
+            Asset b = new Asset("doc1", "world", 3);
+            assertThat(a).isNotEqualTo(b);
+        }
+
+        @Test
+        public void differentVersionIsNotEqual() {
+            Asset a = new Asset("doc1", "hello", 3);
+            Asset b = new Asset("doc1", "hello", 4);
+            assertThat(a).isNotEqualTo(b);
         }
 
         @Test
         public void handlesOtherObjects() {
-            Asset assetA = new Asset("asset1", "Blue", 20, "Guy", 100);
-            String assetB = "not a asset";
-
-            assertThat(assetA).isNotEqualTo(assetB);
+            Asset a = new Asset("doc1", "hello", 3);
+            assertThat(a).isNotEqualTo("not an asset");
         }
 
         @Test
         public void handlesNull() {
-            Asset asset = new Asset("asset1", "Blue", 20, "Guy", 100);
+            Asset a = new Asset("doc1", "hello", 3);
+            assertThat(a).isNotEqualTo(null);
+        }
+    }
 
-            assertThat(asset).isNotEqualTo(null);
+    @Nested
+    class Getters {
+
+        @Test
+        public void returnsDocId() {
+            Asset asset = new Asset("doc42", "", 0);
+            assertThat(asset.getDocId()).isEqualTo("doc42");
+        }
+
+        @Test
+        public void returnsContent() {
+            Asset asset = new Asset("doc1", "abc", 1);
+            assertThat(asset.getContent()).isEqualTo("abc");
+        }
+
+        @Test
+        public void returnsVersion() {
+            Asset asset = new Asset("doc1", "abc", 7);
+            assertThat(asset.getVersion()).isEqualTo(7);
         }
     }
 
     @Test
-    public void toStringIdentifiesAsset() {
-        Asset asset = new Asset("asset1", "Blue", 20, "Guy", 100);
-
-        assertThat(asset.toString()).isEqualTo("Asset@e04f6c53 [assetID=asset1, color=Blue, size=20, owner=Guy, appraisedValue=100]");
+    public void toStringContainsFields() {
+        Asset asset = new Asset("doc1", "hello", 3);
+        assertThat(asset.toString())
+                .contains("doc1")
+                .contains("hello")
+                .contains("3");
     }
 }
