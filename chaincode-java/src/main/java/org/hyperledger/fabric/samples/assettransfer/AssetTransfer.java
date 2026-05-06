@@ -38,6 +38,7 @@ import com.owlike.genson.Genson;
 public final class AssetTransfer implements ContractInterface {
     private static final String SNAP_PREFIX = "SNAP::";
     private static final String LOG_PREFIX = "LOG::";
+    private static final String SNAPSHOT_PREFIX = "SNAPSHOT::";
 
     private final Genson genson = new Genson();
 
@@ -46,7 +47,8 @@ public final class AssetTransfer implements ContractInterface {
         DOC_ALREADY_EXISTS,
         INVALID_OPERATION,
         INVALID_POSITION,
-        INVALID_RANGE
+        INVALID_RANGE,
+        INVALID_SNAPSHOT
     }
 
     @Transaction(intent = Transaction.TYPE.SUBMIT)
@@ -166,6 +168,40 @@ public final class AssetTransfer implements ContractInterface {
         return genson.serialize(ops);
     }
 
+    @Transaction(intent = Transaction.TYPE.SUBMIT)
+    public String SaveSnapshot(final Context ctx, final String docId, final String snapshotJson) {
+        ChaincodeStub stub = ctx.getStub();
+        String marker = stub.getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+
+        DocumentSnapshot snapshot = genson.deserialize(snapshotJson, DocumentSnapshot.class);
+        if (snapshot == null || snapshot.getDocId() == null || !docId.equals(snapshot.getDocId())) {
+            throw new ChaincodeException("Invalid snapshot payload", OTCollabErrors.INVALID_SNAPSHOT.toString());
+        }
+        if (snapshot.getLastLogCursorKey() == null || snapshot.getLastLogCursorKey().isEmpty()) {
+            throw new ChaincodeException("Missing lastLogCursorKey", OTCollabErrors.INVALID_SNAPSHOT.toString());
+        }
+
+        String snapshotKey = snapshotKey(docId);
+        stub.putStringState(snapshotKey, genson.serialize(snapshot));
+        stub.setEvent("SaveSnapshot", genson.serializeBytes(snapshot));
+        return snapshotKey;
+    }
+
+    @Transaction(intent = Transaction.TYPE.EVALUATE)
+    public String GetLatestSnapshot(final Context ctx, final String docId) {
+        ChaincodeStub stub = ctx.getStub();
+        String marker = stub.getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+
+        String snapshotJson = stub.getStringState(snapshotKey(docId));
+        return snapshotJson == null ? "" : snapshotJson;
+    }
+
     private boolean exists(final ChaincodeStub stub, final String key) {
         String value = stub.getStringState(key);
         return value != null && !value.isEmpty();
@@ -173,6 +209,10 @@ public final class AssetTransfer implements ContractInterface {
 
     private String snapKey(final String docId) {
         return SNAP_PREFIX + docId;
+    }
+
+    private String snapshotKey(final String docId) {
+        return SNAPSHOT_PREFIX + docId;
     }
 
     private String logKey(final String docId, final long submittedTs, final String txId, final String opId) {

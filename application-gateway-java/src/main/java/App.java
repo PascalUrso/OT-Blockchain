@@ -66,6 +66,10 @@ public final class App {
     /** CLI flag that replays a recorded operation log against the ledger. */
     private static final String REPLAY_LOG_ARG = "--replay-log";
 
+    /** Frequency of creating snapshots. */
+    private static final int SNAPSHOT_TRIGGER_OPS = 100;
+    private static final long SNAPSHOT_TRIGGER_MS = 60_000L;
+
     // -------------------------------------------------------------------------
     // Infrastructure
     // -------------------------------------------------------------------------
@@ -128,6 +132,10 @@ public final class App {
      * Used in test mode to trigger scheduled operations at deterministic points.
      */
     private int localClock;
+
+    // to record the ops and time since last snapshot for creating snapshots
+    private long lastSnapshotVersion = 0;
+    private long lastSnapshotTimeMs = 0;
 
     // -------------------------------------------------------------------------
     // Test / replay state
@@ -402,21 +410,67 @@ public final class App {
         } catch (Exception e) {
             // Document was already created by another client — nothing to do.
         }
-
-        committedView = "";
-        chainState = new DocumentState(docId, committedView, 0);
-        lastSyncedVersion = chainState.getVersion();
-        localView = committedView;
         localAck = 0;
         localClock = 0;
-        knownClients.clear();
-        knownClients.add(clientId);
-        clientBuffers.clear();
-        clientBuffers.put(clientId, new ArrayList<>());
-        rebuildCommittedFromLedger();
+        localPending.clear();
+        submittedPendingOpIds.clear();
+        submitScheduledOpsAtClock(localClock);
+
+        if (!loadSnapshotFromChain()) {
+            committedView = "";
+            chainState = new DocumentState(docId, committedView, 0);
+            lastSyncedVersion = chainState.getVersion();
+            localView = committedView;
+            knownClients.clear();
+            knownClients.add(clientId);
+            clientBuffers.clear();
+            clientBuffers.put(clientId, new ArrayList<>());
+            rebuildCommittedFromLedger();
+        } else {
+            syncFromChain(true);
+        }
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
     }
+    /**
+     * loadSnapshotFromChain
+     * Called once on startup.
+     */
+    private boolean loadSnapshotFromChain() {
+        try {
+            DocumentSnapshot snapshot = queryLatestSnapshot();
+            if (snapshot == null || snapshot.committedView == null) {
+                return false;
+            }
+
+            committedView = snapshot.committedView;
+            localView = committedView;
+            lastLogCursorKey = snapshot.lastLogCursorKey == null ? "" : snapshot.lastLogCursorKey;
+            lastSyncedVersion = snapshot.version;
+            chainState = new DocumentState(docId, committedView, lastSyncedVersion);
+            lastSnapshotVersion = snapshot.version;
+            lastSnapshotTimeMs = snapshot.timestamp;
+
+
+            knownClients.clear();
+            knownClients.add(clientId);
+            if (snapshot.knownClients != null) {
+                knownClients.addAll(snapshot.knownClients);
+            }
+
+            clientBuffers.clear();
+            if (snapshot.clientBuffers != null) {
+                clientBuffers.putAll(snapshot.clientBuffers);
+            }
+            clientBuffers.putIfAbsent(clientId, new ArrayList<>());
+            rebuildCommittedHistoryFromAllOps(lastLogCursorKey);
+            return true;
+        } catch (Exception e) {
+            System.out.println("Snapshot load failed: " + e.getMessage());
+            return false;
+        }
+    }
+
 
     /**
      * Resets all local OT state and replays the full operation log from the ledger.
@@ -428,7 +482,7 @@ public final class App {
         localPending.clear();
         submittedPendingOpIds.clear();
         lastLogCursorKey = "";
-        submitScheduledOpsAtClock(localClock);
+        
         syncFromChain(true);
     }
 
@@ -821,11 +875,82 @@ public final class App {
         // Integrate the transformed ops into the local view, accounting for pending
         // ops.
         clientRec(transformedBlockOps);
-
+        tryCreateSnapshot();
         if (verbose) {
             System.out.println("Synced to chain version=" + chainState.getVersion());
             printStatus();
         }
+    }
+    private void tryCreateSnapshot() {
+        if (!localPending.isEmpty()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long opsSinceSnapshot = lastSyncedVersion - lastSnapshotVersion;
+        boolean opsTrigger = opsSinceSnapshot >= SNAPSHOT_TRIGGER_OPS;
+        boolean timeTrigger =  (now - lastSnapshotTimeMs) >= SNAPSHOT_TRIGGER_MS;
+        System.out.println("opsTrigger=" + opsTrigger + ", timeTrigger=" + timeTrigger + ", now=" + now + ", lastSnapshotTimeMs=" + lastSnapshotTimeMs);
+        if ((opsTrigger || timeTrigger) && lastSyncedVersion > lastSnapshotVersion) {
+            try {
+                saveSnapshotToChain();
+                lastSnapshotVersion = lastSyncedVersion;
+                lastSnapshotTimeMs = now;
+            } catch (Exception e) {
+                System.out.println("Snapshot save failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private void saveSnapshotToChain() throws Exception {
+        DocumentSnapshot snapshot = new DocumentSnapshot();
+        snapshot.snapshotId = UUID.randomUUID().toString();
+        snapshot.docId = docId;
+        snapshot.lastLogCursorKey = lastLogCursorKey;
+        snapshot.version = lastSyncedVersion;
+        snapshot.timestamp = System.currentTimeMillis();
+        snapshot.committedView = committedView;
+
+        snapshot.clientBuffers = new HashMap<>(clientBuffers);
+        snapshot.knownClients = new HashSet<>(knownClients);
+
+        contract.submitTransaction("SaveSnapshot", docId, gson.toJson(snapshot));
+        System.out.println("Snapshot saved: version=" + snapshot.version + ", cursor=" + snapshot.lastLogCursorKey);
+    }
+
+    private void rebuildCommittedHistoryFromAllOps(final String cursorKey) throws Exception {
+        List<OperationRecord> allOps = queryAllOps();
+        committedHistory.clear();
+        if (allOps.isEmpty()) {
+            return;
+        }
+
+        boolean hasCursor = cursorKey != null && !cursorKey.isBlank();
+        for (OperationRecord record : allOps) {
+            String key = buildLogCursorKey(record);
+            if (hasCursor && key.compareTo(cursorKey) <= 0) {
+                committedHistory.add(record.getOperation());
+            } else if (!hasCursor) {
+                serverRec(record.getOperation());
+            } else {
+                serverRec(record.getOperation());
+            }
+        }
+
+        lastLogCursorKey = buildLogCursorKey(allOps.get(allOps.size() - 1));
+        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
+    }
+
+    private DocumentSnapshot queryLatestSnapshot() throws Exception {
+        byte[] result = contract.evaluateTransaction("GetLatestSnapshot", docId);
+        if (result == null || result.length == 0) {
+            return null;
+        }
+        String json = new String(result, StandardCharsets.UTF_8);
+        if (json.isBlank()) {
+            return null;
+        }
+        return gson.fromJson(json, DocumentSnapshot.class);
     }
 
     /**
@@ -855,7 +980,6 @@ public final class App {
         }
 
         knownClients.add(senderId);
-        knownClients.add(clientId);
 
         // Trim the sender's buffer: the ack value tells us how many remote ops
         // the sender had already seen when it produced this operation.
