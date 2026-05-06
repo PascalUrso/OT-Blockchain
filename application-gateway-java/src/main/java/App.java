@@ -471,6 +471,40 @@ public final class App {
         }
     }
 
+    private void rebuildCommittedHistoryFromAllOps(final String cursorKey) throws Exception {
+        List<OperationRecord> allOps = queryAllOps();
+        committedHistory.clear();
+        if (allOps.isEmpty()) {
+            return;
+        }
+
+        boolean hasCursor = cursorKey != null && !cursorKey.isBlank();
+        for (OperationRecord record : allOps) {
+            String key = buildLogCursorKey(record);
+            if (hasCursor && key.compareTo(cursorKey) <= 0) {
+                committedHistory.add(record.getOperation());
+            } else if (!hasCursor) {
+                serverRec(record.getOperation());
+            } else {
+                serverRec(record.getOperation());
+            }
+        }
+
+        lastLogCursorKey = buildLogCursorKey(allOps.get(allOps.size() - 1));
+        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
+    }
+
+    private DocumentSnapshot queryLatestSnapshot() throws Exception {
+        byte[] result = contract.evaluateTransaction("GetLatestSnapshot", docId);
+        if (result == null || result.length == 0) {
+            return null;
+        }
+        String json = new String(result, StandardCharsets.UTF_8);
+        if (json.isBlank()) {
+            return null;
+        }
+        return gson.fromJson(json, DocumentSnapshot.class);
+    }
 
     /**
      * Resets all local OT state and replays the full operation log from the ledger.
@@ -881,77 +915,7 @@ public final class App {
             printStatus();
         }
     }
-    private void tryCreateSnapshot() {
-        if (!localPending.isEmpty()) {
-            return;
-        }
 
-        long now = System.currentTimeMillis();
-        long opsSinceSnapshot = lastSyncedVersion - lastSnapshotVersion;
-        boolean opsTrigger = opsSinceSnapshot >= SNAPSHOT_TRIGGER_OPS;
-        boolean timeTrigger =  (now - lastSnapshotTimeMs) >= SNAPSHOT_TRIGGER_MS;
-        System.out.println("opsTrigger=" + opsTrigger + ", timeTrigger=" + timeTrigger + ", now=" + now + ", lastSnapshotTimeMs=" + lastSnapshotTimeMs);
-        if ((opsTrigger || timeTrigger) && lastSyncedVersion > lastSnapshotVersion) {
-            try {
-                saveSnapshotToChain();
-                lastSnapshotVersion = lastSyncedVersion;
-                lastSnapshotTimeMs = now;
-            } catch (Exception e) {
-                System.out.println("Snapshot save failed: " + e.getMessage());
-            }
-        }
-    }
-
-    private void saveSnapshotToChain() throws Exception {
-        DocumentSnapshot snapshot = new DocumentSnapshot();
-        snapshot.snapshotId = UUID.randomUUID().toString();
-        snapshot.docId = docId;
-        snapshot.lastLogCursorKey = lastLogCursorKey;
-        snapshot.version = lastSyncedVersion;
-        snapshot.timestamp = System.currentTimeMillis();
-        snapshot.committedView = committedView;
-
-        snapshot.clientBuffers = new HashMap<>(clientBuffers);
-        snapshot.knownClients = new HashSet<>(knownClients);
-
-        contract.submitTransaction("SaveSnapshot", docId, gson.toJson(snapshot));
-        System.out.println("Snapshot saved: version=" + snapshot.version + ", cursor=" + snapshot.lastLogCursorKey);
-    }
-
-    private void rebuildCommittedHistoryFromAllOps(final String cursorKey) throws Exception {
-        List<OperationRecord> allOps = queryAllOps();
-        committedHistory.clear();
-        if (allOps.isEmpty()) {
-            return;
-        }
-
-        boolean hasCursor = cursorKey != null && !cursorKey.isBlank();
-        for (OperationRecord record : allOps) {
-            String key = buildLogCursorKey(record);
-            if (hasCursor && key.compareTo(cursorKey) <= 0) {
-                committedHistory.add(record.getOperation());
-            } else if (!hasCursor) {
-                serverRec(record.getOperation());
-            } else {
-                serverRec(record.getOperation());
-            }
-        }
-
-        lastLogCursorKey = buildLogCursorKey(allOps.get(allOps.size() - 1));
-        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
-    }
-
-    private DocumentSnapshot queryLatestSnapshot() throws Exception {
-        byte[] result = contract.evaluateTransaction("GetLatestSnapshot", docId);
-        if (result == null || result.length == 0) {
-            return null;
-        }
-        String json = new String(result, StandardCharsets.UTF_8);
-        if (json.isBlank()) {
-            return null;
-        }
-        return gson.fromJson(json, DocumentSnapshot.class);
-    }
 
     /**
      * Server-side receive (dOPT-inspired): integrates one newly committed operation
@@ -1017,6 +981,47 @@ public final class App {
 
         return incoming;
     }
+
+    // -------------------------------------------------------------------------
+    // Save snapshot to chain
+    // -------------------------------------------------------------------------
+    private void tryCreateSnapshot() {
+        if (!localPending.isEmpty()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long opsSinceSnapshot = lastSyncedVersion - lastSnapshotVersion;
+        boolean opsTrigger = opsSinceSnapshot >= SNAPSHOT_TRIGGER_OPS;
+        boolean timeTrigger =  (now - lastSnapshotTimeMs) >= SNAPSHOT_TRIGGER_MS;
+        System.out.println("opsTrigger=" + opsTrigger + ", timeTrigger=" + timeTrigger + ", now=" + now + ", lastSnapshotTimeMs=" + lastSnapshotTimeMs);
+        if ((opsTrigger || timeTrigger) && lastSyncedVersion > lastSnapshotVersion) {
+            try {
+                saveSnapshotToChain();
+                lastSnapshotVersion = lastSyncedVersion;
+                lastSnapshotTimeMs = now;
+            } catch (Exception e) {
+                System.out.println("Snapshot save failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private void saveSnapshotToChain() throws Exception {
+        DocumentSnapshot snapshot = new DocumentSnapshot();
+        snapshot.snapshotId = UUID.randomUUID().toString();
+        snapshot.docId = docId;
+        snapshot.lastLogCursorKey = lastLogCursorKey;
+        snapshot.version = lastSyncedVersion;
+        snapshot.timestamp = System.currentTimeMillis();
+        snapshot.committedView = committedView;
+
+        snapshot.clientBuffers = new HashMap<>(clientBuffers);
+        snapshot.knownClients = new HashSet<>(knownClients);
+
+        contract.submitTransaction("SaveSnapshot", docId, gson.toJson(snapshot));
+        System.out.println("Snapshot saved: version=" + snapshot.version + ", cursor=" + snapshot.lastLogCursorKey);
+    }
+
 
     // -------------------------------------------------------------------------
     // Ledger queries
