@@ -1045,16 +1045,6 @@ public final class App {
         }.getType());
     }
 
-    /**
-     * Fetches only the operations committed after {@code afterKeyExclusive}.
-     * Passing an empty string returns all operations from the beginning.
-     */
-    private List<OperationRecord> queryOpsAfter(final String afterKeyExclusive) throws Exception {
-        String cursor = afterKeyExclusive == null ? "" : afterKeyExclusive;
-        byte[] result = contract.evaluateTransaction("QueryOpsAfter", docId, cursor);
-        return gson.fromJson(new String(result, StandardCharsets.UTF_8), new TypeToken<List<OperationRecord>>() {
-        }.getType());
-    }
 
     // -------------------------------------------------------------------------
     // Buffer / ack helpers

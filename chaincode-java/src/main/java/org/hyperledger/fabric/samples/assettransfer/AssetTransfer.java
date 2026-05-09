@@ -123,6 +123,25 @@ public final class AssetTransfer implements ContractInterface {
         return new Asset(docId, "", version);
     }
 
+    @Transaction(intent = Transaction.TYPE.EVALUATE)
+    public String QueryAllOps(final Context ctx, final String docId) {
+        String marker = ctx.getStub().getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+
+        ChaincodeStub stub = ctx.getStub();
+        String startKey = logPrefix(docId);
+        String endKey = logPrefixEnd(docId);
+
+        List<OperationRecord> ops = new ArrayList<>();
+        for (KeyValue kv : stub.getStateByRange(startKey, endKey)) {
+            ops.add(genson.deserialize(kv.getStringValue(), OperationRecord.class));
+        }
+
+        return genson.serialize(ops);
+    }
+    
     @Transaction(intent = Transaction.TYPE.SUBMIT)
     public String SaveSnapshot(final Context ctx, final String docId, final String snapshotJson) {
         ChaincodeStub stub = ctx.getStub();
