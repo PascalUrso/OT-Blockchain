@@ -111,13 +111,16 @@ public final class App {
     /**
      * Cursor used to fetch only new operations from the ledger (incremental sync).
      */
-    private String lastLogCursorKey = "";
+    // `lastLogCursorKey` removed: no longer used (events-only sync)
 
     /**
      * Number of operations committed to the ledger so far (monotonically
      * increasing).
      */
     private long lastSyncedVersion;
+
+    /** Last processed block number from chaincode events. */
+    private long lastEventBlock;
 
     /**
      * Number of remote (non-own) operations received since the last submitted op.
@@ -193,6 +196,12 @@ public final class App {
      * but whose block confirmation has not been received yet.
      */
     private final Set<String> submittedPendingOpIds = new HashSet<>();
+
+    /** IDs of committed operations already processed (dedupe across replays). */
+    private final Set<String> committedOpIds = new HashSet<>();
+
+    /** True once the chaincode event listener has started. */
+    private volatile boolean eventListenerStarted;
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -292,7 +301,7 @@ public final class App {
         while (true) {
             printStatus();
             System.out.println("\n1) INSERT(local pending)  2) DELETE(local pending)  3) UPDATE(local pending)");
-            System.out.println("4) submit 1 local pending  5) submit all local pending  6) manually sync with chain");
+            System.out.println("4) submit 1 local pending  5) submit all local pending  6) manually sync via events");
             System.out.println("7) view all committed ops  8) exit");
             System.out.print("select: ");
             if (!scanner.hasNextLine()) {
@@ -316,7 +325,7 @@ public final class App {
                     submitAllPending();
                     break;
                 case "6":
-                    syncFromChain(true);
+                    manualEventSync();
                     break;
                 case "7":
                     List<OperationRecord> allOps = queryAllOps();
@@ -357,7 +366,7 @@ public final class App {
             TimeUnit.MILLISECONDS.sleep(pollMillis);
         }
 
-        syncFromChain(true);
+        manualEventSync();
         System.out.println("Test mode finished. dispatched=" + nextScheduledOpIndex + "/" + scheduledOps.size());
     }
 
@@ -425,9 +434,8 @@ public final class App {
             knownClients.add(clientId);
             clientBuffers.clear();
             clientBuffers.put(clientId, new ArrayList<>());
+            lastEventBlock = 0;
             rebuildCommittedFromLedger();
-        } else {
-            syncFromChain(true);
         }
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
@@ -445,12 +453,14 @@ public final class App {
 
             committedView = snapshot.committedView;
             localView = committedView;
-            lastLogCursorKey = snapshot.lastLogCursorKey == null ? "" : snapshot.lastLogCursorKey;
             lastSyncedVersion = snapshot.version;
             chainState = new DocumentState(docId, committedView, lastSyncedVersion);
             lastSnapshotVersion = snapshot.version;
             lastSnapshotTimeMs = snapshot.timestamp;
+            lastEventBlock = snapshot.lastBlockNumber;
 
+                committedHistory.clear();
+                committedOpIds.clear();
 
             knownClients.clear();
             knownClients.add(clientId);
@@ -463,35 +473,12 @@ public final class App {
                 clientBuffers.putAll(snapshot.clientBuffers);
             }
             clientBuffers.putIfAbsent(clientId, new ArrayList<>());
-            rebuildCommittedHistoryFromAllOps(lastLogCursorKey);
+            localView = committedView;
             return true;
         } catch (Exception e) {
             System.out.println("Snapshot load failed: " + e.getMessage());
             return false;
         }
-    }
-
-    private void rebuildCommittedHistoryFromAllOps(final String cursorKey) throws Exception {
-        List<OperationRecord> allOps = queryAllOps();
-        committedHistory.clear();
-        if (allOps.isEmpty()) {
-            return;
-        }
-
-        boolean hasCursor = cursorKey != null && !cursorKey.isBlank();
-        for (OperationRecord record : allOps) {
-            String key = buildLogCursorKey(record);
-            if (hasCursor && key.compareTo(cursorKey) <= 0) {
-                committedHistory.add(record.getOperation());
-            } else if (!hasCursor) {
-                serverRec(record.getOperation());
-            } else {
-                serverRec(record.getOperation());
-            }
-        }
-
-        lastLogCursorKey = buildLogCursorKey(allOps.get(allOps.size() - 1));
-        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
     }
 
     private DocumentSnapshot queryLatestSnapshot() throws Exception {
@@ -513,11 +500,16 @@ public final class App {
     private void rebuildCommittedFromLedger() throws Exception {
         committedView = "";
         committedHistory.clear();
+        committedOpIds.clear();
         localPending.clear();
         submittedPendingOpIds.clear();
-        lastLogCursorKey = "";
-        
-        syncFromChain(true);
+        // lastLogCursorKey removed; no-op
+        lastSyncedVersion = 0;
+        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
+
+        if (!eventListenerStarted) {
+            startBlockListener();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -530,21 +522,46 @@ public final class App {
      */
     private void startBlockListener() {
         Thread t = new Thread(() -> {
-            try (var events = network.newBlockEventsRequest().build().getEvents()) {
+            try (var events = network
+                    .newChaincodeEventsRequest(runConfig.chaincodeName)
+                    .startBlock(lastEventBlock + 1)
+                    .build()
+                    .getEvents()) {
+                eventListenerStarted = true;
                 events.forEachRemaining(event -> {
                     try {
-                        System.out.println("New block received: " + event.getHeader().getNumber());
-                        syncFromChain(true);
+                        if (!("SubmitOp::" + docId).equals(event.getEventName())) {
+                            return;
+                        }
+                        if (!runConfig.chaincodeName.equals(event.getChaincodeName())) {
+                            return;
+                        }
+                        OperationRecord record = gson.fromJson(
+                                new String(event.getPayload(), StandardCharsets.UTF_8),
+                                OperationRecord.class);
+                        if (record != null && record.getDocId() != null && !record.getDocId().equals(docId)) {
+                            return;
+                        }
+                        applyCommittedRecordFromEvent(record, event.getBlockNumber());
                     } catch (Exception e) {
-                        System.out.println("Block sync failed: " + e.getMessage());
+                        System.out.println("Chaincode event handling failed: " + e.getMessage());
                     }
                 });
             } catch (Exception e) {
-                System.out.println("Block listener stopped: " + e.getMessage());
+                System.out.println("Chaincode event listener stopped: " + e.getMessage());
             }
         });
         t.setDaemon(true);
         t.start();
+    }
+
+    private void manualEventSync() {
+        if (!eventListenerStarted) {
+            System.out.println("Event listener not running; starting it now.");
+            startBlockListener();
+        }
+        System.out.println("Event-based sync active. Last block=" + lastEventBlock
+                + ", version=" + lastSyncedVersion);
     }
 
     // -------------------------------------------------------------------------
@@ -618,11 +635,7 @@ public final class App {
                 if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
                     System.out.println("MVCC conflict detected, syncing and retrying (" + attempt + "/"
                             + MAX_SUBMIT_RETRIES + ")");
-                    try {
-                        syncFromChain(true);
-                    } catch (Exception syncException) {
-                        System.out.println("Sync failed: " + syncException.getMessage());
-                    }
+                    manualEventSync();
                     continue;
                 }
                 System.out.println("Submit failed: " + e.getMessage());
@@ -886,34 +899,29 @@ public final class App {
      * Synchronised to prevent concurrent execution by the block-listener thread
      * and the main thread (e.g. manual sync from the menu).
      */
-    private synchronized void syncFromChain(final boolean verbose) throws Exception {
-        List<OperationRecord> newCommittedOps = queryOpsAfter(lastLogCursorKey);
-        if (newCommittedOps.isEmpty()) {
+
+
+    private void applyCommittedRecordFromEvent(final OperationRecord record, final long blockNumber) {
+        if (record == null || record.getOperation() == null) {
+            lastEventBlock = Math.max(lastEventBlock, blockNumber);
+            return;
+        }
+        String opId = record.getOperation().getOpId();
+        if (opId != null && committedOpIds.contains(opId)) {
+            lastEventBlock = Math.max(lastEventBlock, blockNumber);
             return;
         }
 
-        // --- Server side ---
-        // Run each new op through the server-side OT pipeline to produce the
-        // canonical (fully-transformed) version of that op.
+        Operation transformed = serverRec(record.getOperation());
         List<Operation> transformedBlockOps = new ArrayList<>();
-        for (OperationRecord record : newCommittedOps) {
-            System.out.println("Replaying committed op from ledger: " + record.getOperation().getOpId());
-            Operation transformed = serverRec(record.getOperation());
-            transformedBlockOps.add(transformed);
-        }
+        transformedBlockOps.add(transformed);
 
-        lastLogCursorKey = buildLogCursorKey(newCommittedOps.get(newCommittedOps.size() - 1));
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
-
-        // --- Client side ---
-        // Integrate the transformed ops into the local view, accounting for pending
-        // ops.
         clientRec(transformedBlockOps);
+        lastEventBlock = Math.max(lastEventBlock, blockNumber);
         tryCreateSnapshot();
-        if (verbose) {
-            System.out.println("Synced to chain version=" + chainState.getVersion());
-            printStatus();
-        }
+        System.out.println("Synced from chaincode event block=" + blockNumber
+                + ", version=" + chainState.getVersion() + ", opId=" + opId);
     }
 
 
@@ -968,6 +976,9 @@ public final class App {
 
         committedView = OTEngine.apply(committedView, incoming);
         committedHistory.add(incoming);
+        if (incoming.getOpId() != null) {
+            committedOpIds.add(incoming.getOpId());
+        }
         lastSyncedVersion++;
 
         // Broadcast the transformed op to every other client's buffer.
@@ -1010,16 +1021,16 @@ public final class App {
         DocumentSnapshot snapshot = new DocumentSnapshot();
         snapshot.snapshotId = UUID.randomUUID().toString();
         snapshot.docId = docId;
-        snapshot.lastLogCursorKey = lastLogCursorKey;
         snapshot.version = lastSyncedVersion;
         snapshot.timestamp = System.currentTimeMillis();
+        snapshot.lastBlockNumber = lastEventBlock;
         snapshot.committedView = committedView;
 
         snapshot.clientBuffers = new HashMap<>(clientBuffers);
         snapshot.knownClients = new HashSet<>(knownClients);
 
         contract.submitTransaction("SaveSnapshot", docId, gson.toJson(snapshot));
-        System.out.println("Snapshot saved: version=" + snapshot.version + ", cursor=" + snapshot.lastLogCursorKey);
+        System.out.println("Snapshot saved: version=" + snapshot.version);
     }
 
 
@@ -1116,21 +1127,7 @@ public final class App {
     // Utilities
     // -------------------------------------------------------------------------
 
-    /**
-     * Builds the lexicographically ordered key used as an exclusive cursor for
-     * {@link #queryOpsAfter}. The key format mirrors the one used by the chaincode
-     * log key: {@code LOG::<docId>::<paddedTs>::<txId>::<opId>}.
-     */
-    private String buildLogCursorKey(final OperationRecord record) {
-        if (record == null || record.getOperation() == null) {
-            return "";
-        }
-        return String.format("LOG::%s::%020d::%s::%s",
-                docId,
-                record.getCommittedVersion(),
-                record.getTxId() == null ? "" : record.getTxId(),
-                record.getOperation().getOpId() == null ? "" : record.getOperation().getOpId());
-    }
+    /* buildLogCursorKey removed: events-only sync, cursor no longer used */
 
     private void printStatus() {
         System.out.println("\n==== Current Status ====");

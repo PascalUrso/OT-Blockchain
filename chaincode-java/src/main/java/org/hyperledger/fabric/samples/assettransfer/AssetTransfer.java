@@ -98,11 +98,11 @@ public final class AssetTransfer implements ContractInterface {
             op.getValue(),
             op.getTimestamp(),
             op.getAck());
-        OperationRecord record = new OperationRecord(committedOp, committedOrder, stub.getTxId());
+        OperationRecord record = new OperationRecord(docId, committedOp, committedOrder, stub.getTxId());
 
         // Write to operation log (append-only key, no shared-key write conflict)
         stub.putStringState(logKey(docId, committedOrder, stub.getTxId(), op.getOpId()), genson.serialize(record));
-        stub.setEvent("SubmitOp", genson.serializeBytes(record));
+        stub.setEvent("SubmitOp::" + docId, genson.serializeBytes(record));
 
         return record;
     }
@@ -123,51 +123,6 @@ public final class AssetTransfer implements ContractInterface {
         return new Asset(docId, "", version);
     }
 
-    @Transaction(intent = Transaction.TYPE.EVALUATE)
-    public String QueryOps(final Context ctx, final String docId, final long startVersion, final long endVersion) {
-        return QueryAllOps(ctx, docId);
-    }
-
-    @Transaction(intent = Transaction.TYPE.EVALUATE)
-    public String QueryAllOps(final Context ctx, final String docId) {
-        String marker = ctx.getStub().getStringState(snapKey(docId));
-        if (marker == null || marker.isEmpty()) {
-            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
-        }
-
-        ChaincodeStub stub = ctx.getStub();
-        String startKey = logPrefix(docId);
-        String endKey = logPrefixEnd(docId);
-
-        List<OperationRecord> ops = new ArrayList<>();
-        for (KeyValue kv : stub.getStateByRange(startKey, endKey)) {
-            ops.add(genson.deserialize(kv.getStringValue(), OperationRecord.class));
-        }
-
-        return genson.serialize(ops);
-    }
-
-    @Transaction(intent = Transaction.TYPE.EVALUATE)
-    public String QueryOpsAfter(final Context ctx, final String docId, final String afterKeyExclusive) {
-        String marker = ctx.getStub().getStringState(snapKey(docId));
-        if (marker == null || marker.isEmpty()) {
-            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
-        }
-
-        ChaincodeStub stub = ctx.getStub();
-        String startKey = (afterKeyExclusive == null || afterKeyExclusive.isEmpty())
-                ? logPrefix(docId)
-                : afterKeyExclusive + "\u0000";
-        String endKey = logPrefixEnd(docId);
-
-        List<OperationRecord> ops = new ArrayList<>();
-        for (KeyValue kv : stub.getStateByRange(startKey, endKey)) {
-            ops.add(genson.deserialize(kv.getStringValue(), OperationRecord.class));
-        }
-
-        return genson.serialize(ops);
-    }
-
     @Transaction(intent = Transaction.TYPE.SUBMIT)
     public String SaveSnapshot(final Context ctx, final String docId, final String snapshotJson) {
         ChaincodeStub stub = ctx.getStub();
@@ -180,11 +135,18 @@ public final class AssetTransfer implements ContractInterface {
         if (snapshot == null || snapshot.getDocId() == null || !docId.equals(snapshot.getDocId())) {
             throw new ChaincodeException("Invalid snapshot payload", OTCollabErrors.INVALID_SNAPSHOT.toString());
         }
-        if (snapshot.getLastLogCursorKey() == null || snapshot.getLastLogCursorKey().isEmpty()) {
-            throw new ChaincodeException("Missing lastLogCursorKey", OTCollabErrors.INVALID_SNAPSHOT.toString());
-        }
+        // lastLogCursorKey removed; no longer required
 
         String snapshotKey = snapshotKey(docId);
+        String existingJson = stub.getStringState(snapshotKey);
+        if (existingJson != null && !existingJson.isEmpty()) {
+            DocumentSnapshot existing = genson.deserialize(existingJson, DocumentSnapshot.class);
+            if (existing != null && snapshot.getVersion() <= existing.getVersion()) {
+                throw new ChaincodeException(
+                        "Stale snapshot version: " + snapshot.getVersion(),
+                        OTCollabErrors.INVALID_SNAPSHOT.toString());
+            }
+        }
         stub.putStringState(snapshotKey, genson.serialize(snapshot));
         stub.setEvent("SaveSnapshot", genson.serializeBytes(snapshot));
         return snapshotKey;

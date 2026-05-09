@@ -22,13 +22,13 @@ public final class DocumentSnapshot {
     private final String docId;
 
     @Property()
-    private final String lastLogCursorKey;
-
-    @Property()
     private final long version;
 
     @Property()
     private final long timestamp;
+
+    @Property()
+    private final long lastBlockNumber;
 
     @Property()
     private final String committedView;
@@ -42,17 +42,17 @@ public final class DocumentSnapshot {
     public DocumentSnapshot(
             @JsonProperty("snapshotId") final String snapshotId,
             @JsonProperty("docId") final String docId,
-            @JsonProperty("lastLogCursorKey") final String lastLogCursorKey,
             @JsonProperty("version") final long version,
             @JsonProperty("timestamp") final long timestamp,
+            @JsonProperty("lastBlockNumber") final long lastBlockNumber,
             @JsonProperty("committedView") final String committedView,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
             @JsonProperty("knownClients") final Set<String> knownClients) {
         this.snapshotId = snapshotId;
         this.docId = docId;
-        this.lastLogCursorKey = lastLogCursorKey;
         this.version = version;
         this.timestamp = timestamp;
+        this.lastBlockNumber = lastBlockNumber;
         this.committedView = committedView;
         this.clientBuffers = clientBuffers;
         this.knownClients = knownClients;
@@ -66,9 +66,6 @@ public final class DocumentSnapshot {
         return docId;
     }
 
-    public String getLastLogCursorKey() {
-        return lastLogCursorKey;
-    }
 
     public long getVersion() {
         return version;
@@ -76,6 +73,10 @@ public final class DocumentSnapshot {
 
     public long getTimestamp() {
         return timestamp;
+    }
+
+    public long getLastBlockNumber() {
+        return lastBlockNumber;
     }
 
     public String getCommittedView() {

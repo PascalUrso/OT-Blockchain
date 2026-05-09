@@ -12,6 +12,9 @@ import com.owlike.genson.annotation.JsonProperty;
 @DataType()
 public final class OperationRecord {
     @Property()
+    private final String docId;
+
+    @Property()
     private final Operation operation;
 
     @Property()
@@ -21,12 +24,18 @@ public final class OperationRecord {
     private final String txId;
 
     public OperationRecord(
+            @JsonProperty("docId") final String docId,
             @JsonProperty("operation") final Operation operation,
             @JsonProperty("committedVersion") final long committedVersion,
             @JsonProperty("txId") final String txId) {
+        this.docId = docId;
         this.operation = operation;
         this.committedVersion = committedVersion;
         this.txId = txId;
+    }
+
+    public String getDocId() {
+        return docId;
     }
 
     public Operation getOperation() {
