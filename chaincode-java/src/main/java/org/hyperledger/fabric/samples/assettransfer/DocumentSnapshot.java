@@ -34,9 +34,6 @@ public final class DocumentSnapshot {
     private final String committedView;
 
     @Property()
-    private final List<Operation> committedHistory;
-
-    @Property()
     private final Map<String, List<Operation>> clientBuffers;
 
     @Property()
@@ -49,7 +46,6 @@ public final class DocumentSnapshot {
             @JsonProperty("version") final long version,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("committedView") final String committedView,
-            @JsonProperty("committedHistory") final List<Operation> committedHistory,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
             @JsonProperty("knownClients") final Set<String> knownClients) {
         this.snapshotId = snapshotId;
@@ -58,7 +54,6 @@ public final class DocumentSnapshot {
         this.version = version;
         this.timestamp = timestamp;
         this.committedView = committedView;
-        this.committedHistory = committedHistory;
         this.clientBuffers = clientBuffers;
         this.knownClients = knownClients;
     }
@@ -87,9 +82,6 @@ public final class DocumentSnapshot {
         return committedView;
     }
 
-    public List<Operation> getCommittedHistory() {
-        return committedHistory;
-    }
 
     public Map<String, List<Operation>> getClientBuffers() {
         return clientBuffers;
