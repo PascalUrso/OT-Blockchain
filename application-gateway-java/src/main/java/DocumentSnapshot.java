@@ -8,8 +8,8 @@ public final class DocumentSnapshot {
     public long version;
     public long timestamp;
     public long lastBlockNumber;
-    public String lastEventTxId;
-    public String lastEventOpId;
+    public int lastEventTxIndex;
+    public int lastEventActionIndex;
     public String committedView;
     public Map<String, List<Operation>> clientBuffers;
     public Set<String> knownClients;

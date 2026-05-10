@@ -31,10 +31,10 @@ public final class DocumentSnapshot {
     private final long lastBlockNumber;
 
     @Property()
-    private final String lastEventTxId;
+    private final int lastEventTxIndex;
 
     @Property()
-    private final String lastEventOpId;
+    private final int lastEventActionIndex;
 
     @Property()
     private final String committedView;
@@ -51,8 +51,8 @@ public final class DocumentSnapshot {
             @JsonProperty("version") final long version,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("lastBlockNumber") final long lastBlockNumber,
-            @JsonProperty("lastEventTxId") final String lastEventTxId,
-            @JsonProperty("lastEventOpId") final String lastEventOpId,
+            @JsonProperty("lastEventTxIndex") final int lastEventTxIndex,
+            @JsonProperty("lastEventActionIndex") final int lastEventActionIndex,
             @JsonProperty("committedView") final String committedView,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
             @JsonProperty("knownClients") final Set<String> knownClients) {
@@ -61,8 +61,8 @@ public final class DocumentSnapshot {
         this.version = version;
         this.timestamp = timestamp;
         this.lastBlockNumber = lastBlockNumber;
-        this.lastEventTxId = lastEventTxId;
-        this.lastEventOpId = lastEventOpId;
+        this.lastEventTxIndex = lastEventTxIndex;
+        this.lastEventActionIndex = lastEventActionIndex;
         this.committedView = committedView;
         this.clientBuffers = clientBuffers;
         this.knownClients = knownClients;
@@ -89,12 +89,12 @@ public final class DocumentSnapshot {
         return lastBlockNumber;
     }
 
-    public String getLastEventTxId() {
-        return lastEventTxId;
+    public int getLastEventTxIndex() {
+        return lastEventTxIndex;
     }
 
-    public String getLastEventOpId() {
-        return lastEventOpId;
+    public int getLastEventActionIndex() {
+        return lastEventActionIndex;
     }
 
     public String getCommittedView() {

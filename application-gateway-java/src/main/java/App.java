@@ -12,6 +12,12 @@ import org.hyperledger.fabric.client.Contract;
 import org.hyperledger.fabric.client.Gateway;
 import org.hyperledger.fabric.client.Hash;
 import org.hyperledger.fabric.client.Network;
+import org.hyperledger.fabric.protos.peer.ChaincodeEvent;
+import org.hyperledger.fabric.protos.peer.FilteredBlock;
+import org.hyperledger.fabric.protos.peer.FilteredChaincodeAction;
+import org.hyperledger.fabric.protos.peer.FilteredTransaction;
+import org.hyperledger.fabric.protos.peer.FilteredTransactionActions;
+import org.hyperledger.fabric.protos.peer.TxValidationCode;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -122,11 +128,11 @@ public final class App {
     /** Last processed block number from chaincode events. */
     private long lastEventBlock;
 
-    /** Last processed transaction id within lastEventBlock. */
-    private String lastEventTxId = "";
+    /** Last processed transaction index within lastEventBlock. */
+    private int lastEventTxIndex = -1;
 
-    /** Last processed operation id within lastEventBlock. */
-    private String lastEventOpId = "";
+    /** Last processed chaincode action index within lastEventBlock. */
+    private int lastEventActionIndex = -1;
 
     /**
      * Number of remote (non-own) operations received since the last submitted op.
@@ -464,8 +470,8 @@ public final class App {
             lastSnapshotVersion = snapshot.version;
             lastSnapshotTimeMs = snapshot.timestamp;
             lastEventBlock = snapshot.lastBlockNumber;
-            lastEventTxId = snapshot.lastEventTxId == null ? "" : snapshot.lastEventTxId;
-            lastEventOpId = snapshot.lastEventOpId == null ? "" : snapshot.lastEventOpId;
+            lastEventTxIndex = snapshot.lastEventTxIndex;
+            lastEventActionIndex = snapshot.lastEventActionIndex;
 
                 committedHistory.clear();
                 committedOpIds.clear();
@@ -514,8 +520,8 @@ public final class App {
         // lastLogCursorKey removed; no-op
         lastSyncedVersion = 0;
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
-        lastEventTxId = "";
-        lastEventOpId = "";
+        lastEventTxIndex = -1;
+        lastEventActionIndex = -1;
 
         if (!eventListenerStarted) {
             startBlockListener();
@@ -532,47 +538,17 @@ public final class App {
      */
     private void startBlockListener() {
         Thread t = new Thread(() -> {
-            try (var events = network
-                    .newChaincodeEventsRequest(runConfig.chaincodeName)
+            try (var blocks = network
+                    .newFilteredBlockEventsRequest()
                     .startBlock(lastEventBlock)
                     .build()
                     .getEvents()) {
-                final boolean[] resume = new boolean[] {
-                        lastEventBlock == 0 || lastEventTxId.isEmpty() || lastEventOpId.isEmpty()
-                };
                 eventListenerStarted = true;
-                events.forEachRemaining(event -> {
+                blocks.forEachRemaining(block -> {
                     try {
-                        if (!("SubmitOp::" + docId).equals(event.getEventName())) {
-                            return;
-                        }
-                        if (!runConfig.chaincodeName.equals(event.getChaincodeName())) {
-                            return;
-                        }
-                        OperationRecord record = gson.fromJson(
-                                new String(event.getPayload(), StandardCharsets.UTF_8),
-                                OperationRecord.class);
-                        if (record != null && record.getDocId() != null && !record.getDocId().equals(docId)) {
-                            return;
-                        }
-
-                        long blockNumber = event.getBlockNumber();
-                        String txId = event.getTransactionId();
-                        String opId = record != null && record.getOperation() != null
-                                ? record.getOperation().getOpId()
-                                : null;
-
-                        if (!resume[0]) {
-                            if (blockNumber == lastEventBlock
-                                    && txId != null && txId.equals(lastEventTxId)
-                                    && opId != null && opId.equals(lastEventOpId)) {
-                                resume[0] = true;
-                            }
-                            return;
-                        }
-                        applyCommittedRecordFromEvent(record, blockNumber);
+                        processFilteredBlock(block);
                     } catch (Exception e) {
-                        System.out.println("Chaincode event handling failed: " + e.getMessage());
+                        System.out.println("Filtered block handling failed: " + e.getMessage());
                     }
                 });
             } catch (Exception e) {
@@ -581,6 +557,62 @@ public final class App {
         });
         t.setDaemon(true);
         t.start();
+    }
+
+    private void processFilteredBlock(final FilteredBlock block) {
+        if (block == null) {
+            return;
+        }
+        long blockNumber = block.getNumber();
+        List<FilteredTransaction> txs = block.getFilteredTransactionsList();
+
+        for (int txIndex = 0; txIndex < txs.size(); txIndex++) {
+            if (blockNumber < lastEventBlock) {
+                continue;
+            }
+            if (blockNumber == lastEventBlock && txIndex < lastEventTxIndex) {
+                continue;
+            }
+
+            FilteredTransaction tx = txs.get(txIndex);
+            if (tx == null || tx.getTxValidationCode() != TxValidationCode.VALID) {
+                continue;
+            }
+            if (!tx.hasTransactionActions()) {
+                continue;
+            }
+
+            FilteredTransactionActions actions = tx.getTransactionActions();
+            List<FilteredChaincodeAction> chaincodeActions = actions.getChaincodeActionsList();
+            for (int actionIndex = 0; actionIndex < chaincodeActions.size(); actionIndex++) {
+                if (blockNumber == lastEventBlock
+                        && txIndex == lastEventTxIndex
+                        && actionIndex <= lastEventActionIndex) {
+                    continue;
+                }
+
+                FilteredChaincodeAction action = chaincodeActions.get(actionIndex);
+                if (action == null || !action.hasChaincodeEvent()) {
+                    continue;
+                }
+
+                ChaincodeEvent event = action.getChaincodeEvent();
+                if (!runConfig.chaincodeName.equals(event.getChaincodeId())) {
+                    continue;
+                }
+                if (!("SubmitOp::" + docId).equals(event.getEventName())) {
+                    continue;
+                }
+
+                OperationRecord record = gson.fromJson(
+                        new String(event.getPayload().toByteArray(), StandardCharsets.UTF_8),
+                        OperationRecord.class);
+                if (record != null && record.getDocId() != null && !record.getDocId().equals(docId)) {
+                    continue;
+                }
+                applyCommittedRecordFromEvent(record, blockNumber, txIndex, actionIndex);
+            }
+        }
     }
 
     private void manualEventSync() {
@@ -929,16 +961,17 @@ public final class App {
      */
 
 
-    private void applyCommittedRecordFromEvent(final OperationRecord record, final long blockNumber) {
+    private void applyCommittedRecordFromEvent(final OperationRecord record, final long blockNumber,
+            final int txIndex, final int actionIndex) {
+        lastEventBlock = blockNumber;
+        lastEventTxIndex = txIndex;
+        lastEventActionIndex = actionIndex;
+
         if (record == null || record.getOperation() == null) {
-            lastEventBlock = Math.max(lastEventBlock, blockNumber);
             return;
         }
         String opId = record.getOperation().getOpId();
         if (opId != null && committedOpIds.contains(opId)) {
-            lastEventBlock = Math.max(lastEventBlock, blockNumber);
-            lastEventTxId = record.getTxId() == null ? "" : record.getTxId();
-            lastEventOpId = opId;
             return;
         }
 
@@ -948,11 +981,8 @@ public final class App {
 
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
         clientRec(transformedBlockOps);
-        lastEventBlock = Math.max(lastEventBlock, blockNumber);
-        lastEventTxId = record.getTxId() == null ? "" : record.getTxId();
-        lastEventOpId = opId;
         tryCreateSnapshot();
-        System.out.println("Synced from chaincode event block=" + blockNumber
+        System.out.println("Synced from filtered block=" + blockNumber
                 + ", version=" + chainState.getVersion() + ", opId=" + opId);
     }
 
@@ -1056,8 +1086,8 @@ public final class App {
         snapshot.version = lastSyncedVersion;
         snapshot.timestamp = System.currentTimeMillis();
         snapshot.lastBlockNumber = lastEventBlock;
-        snapshot.lastEventTxId = lastEventTxId;
-        snapshot.lastEventOpId = lastEventOpId;
+        snapshot.lastEventTxIndex = lastEventTxIndex;
+        snapshot.lastEventActionIndex = lastEventActionIndex;
         snapshot.committedView = committedView;
 
         snapshot.clientBuffers = new HashMap<>(clientBuffers);
