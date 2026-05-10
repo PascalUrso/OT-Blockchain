@@ -31,6 +31,12 @@ public final class DocumentSnapshot {
     private final long lastBlockNumber;
 
     @Property()
+    private final String lastEventTxId;
+
+    @Property()
+    private final String lastEventOpId;
+
+    @Property()
     private final String committedView;
 
     @Property()
@@ -45,6 +51,8 @@ public final class DocumentSnapshot {
             @JsonProperty("version") final long version,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("lastBlockNumber") final long lastBlockNumber,
+            @JsonProperty("lastEventTxId") final String lastEventTxId,
+            @JsonProperty("lastEventOpId") final String lastEventOpId,
             @JsonProperty("committedView") final String committedView,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
             @JsonProperty("knownClients") final Set<String> knownClients) {
@@ -53,6 +61,8 @@ public final class DocumentSnapshot {
         this.version = version;
         this.timestamp = timestamp;
         this.lastBlockNumber = lastBlockNumber;
+        this.lastEventTxId = lastEventTxId;
+        this.lastEventOpId = lastEventOpId;
         this.committedView = committedView;
         this.clientBuffers = clientBuffers;
         this.knownClients = knownClients;
@@ -77,6 +87,14 @@ public final class DocumentSnapshot {
 
     public long getLastBlockNumber() {
         return lastBlockNumber;
+    }
+
+    public String getLastEventTxId() {
+        return lastEventTxId;
+    }
+
+    public String getLastEventOpId() {
+        return lastEventOpId;
     }
 
     public String getCommittedView() {

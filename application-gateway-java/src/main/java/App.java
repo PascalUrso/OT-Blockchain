@@ -122,6 +122,12 @@ public final class App {
     /** Last processed block number from chaincode events. */
     private long lastEventBlock;
 
+    /** Last processed transaction id within lastEventBlock. */
+    private String lastEventTxId = "";
+
+    /** Last processed operation id within lastEventBlock. */
+    private String lastEventOpId = "";
+
     /**
      * Number of remote (non-own) operations received since the last submitted op.
      * Piggybacked as the {@code ack} field on the next outgoing transaction so the
@@ -458,6 +464,8 @@ public final class App {
             lastSnapshotVersion = snapshot.version;
             lastSnapshotTimeMs = snapshot.timestamp;
             lastEventBlock = snapshot.lastBlockNumber;
+            lastEventTxId = snapshot.lastEventTxId == null ? "" : snapshot.lastEventTxId;
+            lastEventOpId = snapshot.lastEventOpId == null ? "" : snapshot.lastEventOpId;
 
                 committedHistory.clear();
                 committedOpIds.clear();
@@ -506,6 +514,8 @@ public final class App {
         // lastLogCursorKey removed; no-op
         lastSyncedVersion = 0;
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
+        lastEventTxId = "";
+        lastEventOpId = "";
 
         if (!eventListenerStarted) {
             startBlockListener();
@@ -524,9 +534,12 @@ public final class App {
         Thread t = new Thread(() -> {
             try (var events = network
                     .newChaincodeEventsRequest(runConfig.chaincodeName)
-                    .startBlock(lastEventBlock + 1)
+                    .startBlock(lastEventBlock)
                     .build()
                     .getEvents()) {
+                final boolean[] resume = new boolean[] {
+                        lastEventBlock == 0 || lastEventTxId.isEmpty() || lastEventOpId.isEmpty()
+                };
                 eventListenerStarted = true;
                 events.forEachRemaining(event -> {
                     try {
@@ -542,7 +555,22 @@ public final class App {
                         if (record != null && record.getDocId() != null && !record.getDocId().equals(docId)) {
                             return;
                         }
-                        applyCommittedRecordFromEvent(record, event.getBlockNumber());
+
+                        long blockNumber = event.getBlockNumber();
+                        String txId = event.getTransactionId();
+                        String opId = record != null && record.getOperation() != null
+                                ? record.getOperation().getOpId()
+                                : null;
+
+                        if (!resume[0]) {
+                            if (blockNumber == lastEventBlock
+                                    && txId != null && txId.equals(lastEventTxId)
+                                    && opId != null && opId.equals(lastEventOpId)) {
+                                resume[0] = true;
+                            }
+                            return;
+                        }
+                        applyCommittedRecordFromEvent(record, blockNumber);
                     } catch (Exception e) {
                         System.out.println("Chaincode event handling failed: " + e.getMessage());
                     }
@@ -909,6 +937,8 @@ public final class App {
         String opId = record.getOperation().getOpId();
         if (opId != null && committedOpIds.contains(opId)) {
             lastEventBlock = Math.max(lastEventBlock, blockNumber);
+            lastEventTxId = record.getTxId() == null ? "" : record.getTxId();
+            lastEventOpId = opId;
             return;
         }
 
@@ -919,6 +949,8 @@ public final class App {
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
         clientRec(transformedBlockOps);
         lastEventBlock = Math.max(lastEventBlock, blockNumber);
+        lastEventTxId = record.getTxId() == null ? "" : record.getTxId();
+        lastEventOpId = opId;
         tryCreateSnapshot();
         System.out.println("Synced from chaincode event block=" + blockNumber
                 + ", version=" + chainState.getVersion() + ", opId=" + opId);
@@ -1024,6 +1056,8 @@ public final class App {
         snapshot.version = lastSyncedVersion;
         snapshot.timestamp = System.currentTimeMillis();
         snapshot.lastBlockNumber = lastEventBlock;
+        snapshot.lastEventTxId = lastEventTxId;
+        snapshot.lastEventOpId = lastEventOpId;
         snapshot.committedView = committedView;
 
         snapshot.clientBuffers = new HashMap<>(clientBuffers);
