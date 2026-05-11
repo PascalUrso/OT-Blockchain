@@ -8,15 +8,23 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.reflect.TypeToken;
+import com.google.protobuf.ByteString;
 import org.hyperledger.fabric.client.Contract;
 import org.hyperledger.fabric.client.Gateway;
 import org.hyperledger.fabric.client.Hash;
 import org.hyperledger.fabric.client.Network;
+import org.hyperledger.fabric.protos.common.Block;
+import org.hyperledger.fabric.protos.common.BlockMetadataIndex;
+import org.hyperledger.fabric.protos.common.ChannelHeader;
+import org.hyperledger.fabric.protos.common.Envelope;
+import org.hyperledger.fabric.protos.common.HeaderType;
+import org.hyperledger.fabric.protos.common.Payload;
+import org.hyperledger.fabric.protos.peer.ChaincodeAction;
+import org.hyperledger.fabric.protos.peer.ChaincodeActionPayload;
 import org.hyperledger.fabric.protos.peer.ChaincodeEvent;
-import org.hyperledger.fabric.protos.peer.FilteredBlock;
-import org.hyperledger.fabric.protos.peer.FilteredChaincodeAction;
-import org.hyperledger.fabric.protos.peer.FilteredTransaction;
-import org.hyperledger.fabric.protos.peer.FilteredTransactionActions;
+import org.hyperledger.fabric.protos.peer.ProposalResponsePayload;
+import org.hyperledger.fabric.protos.peer.Transaction;
+import org.hyperledger.fabric.protos.peer.TransactionAction;
 import org.hyperledger.fabric.protos.peer.TxValidationCode;
 
 import java.io.IOException;
@@ -35,6 +43,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Main client application for OT-based collaborative editing on Hyperledger
@@ -179,7 +189,7 @@ public final class App {
      * transformation.
      * Used to initialise the per-client buffers of late-joining peers.
      */
-    private final List<Operation> committedHistory = new ArrayList<>();
+    
 
     /**
      * Per-client "outstanding" buffers: for a given sender, the buffer holds the
@@ -209,11 +219,11 @@ public final class App {
      */
     private final Set<String> submittedPendingOpIds = new HashSet<>();
 
-    /** IDs of committed operations already processed (dedupe across replays). */
-    private final Set<String> committedOpIds = new HashSet<>();
-
     /** True once the chaincode event listener has started. */
     private volatile boolean eventListenerStarted;
+
+    /** True after the first submitted operation has carried the cursor metadata. */
+    private boolean cursorAttachedToLedger;
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -243,6 +253,9 @@ public final class App {
     // -------------------------------------------------------------------------
 
     public static void main(final String[] args) throws Exception {
+        Logger.getLogger("io.grpc").setLevel(Level.WARNING);
+        Logger.getLogger("io.grpc.internal").setLevel(Level.WARNING);
+
         TestRunConfig config = loadRunConfig(args);
         var grpcChannel = Connections.newGrpcConnection(config.toGatewayProfile());
         var builder = Gateway.newInstance()
@@ -302,7 +315,9 @@ public final class App {
         }
 
         bootstrap();
-        startBlockListener();
+        if (!eventListenerStarted) {
+            startBlockListener();
+        }
 
         if (testMode) {
             runTestMode();
@@ -433,6 +448,7 @@ public final class App {
         }
         localAck = 0;
         localClock = 0;
+        cursorAttachedToLedger = false;
         localPending.clear();
         submittedPendingOpIds.clear();
         submitScheduledOpsAtClock(localClock);
@@ -473,9 +489,6 @@ public final class App {
             lastEventTxIndex = snapshot.lastEventTxIndex;
             lastEventActionIndex = snapshot.lastEventActionIndex;
 
-                committedHistory.clear();
-                committedOpIds.clear();
-
             knownClients.clear();
             knownClients.add(clientId);
             if (snapshot.knownClients != null) {
@@ -513,8 +526,6 @@ public final class App {
      */
     private void rebuildCommittedFromLedger() throws Exception {
         committedView = "";
-        committedHistory.clear();
-        committedOpIds.clear();
         localPending.clear();
         submittedPendingOpIds.clear();
         // lastLogCursorKey removed; no-op
@@ -537,34 +548,43 @@ public final class App {
      * On each new block the client re-syncs its local state from the ledger.
      */
     private void startBlockListener() {
+        if (eventListenerStarted) {
+            return;
+        }
+        eventListenerStarted = true;
         Thread t = new Thread(() -> {
             try (var blocks = network
-                    .newFilteredBlockEventsRequest()
+                    .newBlockEventsRequest()
                     .startBlock(lastEventBlock)
                     .build()
                     .getEvents()) {
-                eventListenerStarted = true;
                 blocks.forEachRemaining(block -> {
                     try {
-                        processFilteredBlock(block);
+                        processBlock(block);
                     } catch (Exception e) {
-                        System.out.println("Filtered block handling failed: " + e.getMessage());
+                        System.out.println("Block handling failed: " + e.getMessage());
                     }
                 });
             } catch (Exception e) {
                 System.out.println("Chaincode event listener stopped: " + e.getMessage());
+            } finally {
+                eventListenerStarted = false;
             }
         });
         t.setDaemon(true);
         t.start();
     }
 
-    private void processFilteredBlock(final FilteredBlock block) {
+    private void processBlock(final Block block) {
         if (block == null) {
             return;
         }
-        long blockNumber = block.getNumber();
-        List<FilteredTransaction> txs = block.getFilteredTransactionsList();
+        long blockNumber = block.getHeader().getNumber();
+        List<ByteString> txs = block.getData().getDataList();
+        ByteString txFilter = ByteString.EMPTY;
+        if (block.hasMetadata() && block.getMetadata().getMetadataCount() > BlockMetadataIndex.TRANSACTIONS_FILTER_VALUE) {
+            txFilter = block.getMetadata().getMetadataList().get(BlockMetadataIndex.TRANSACTIONS_FILTER_VALUE);
+        }
 
         for (int txIndex = 0; txIndex < txs.size(); txIndex++) {
             if (blockNumber < lastEventBlock) {
@@ -574,43 +594,70 @@ public final class App {
                 continue;
             }
 
-            FilteredTransaction tx = txs.get(txIndex);
-            if (tx == null || tx.getTxValidationCode() != TxValidationCode.VALID) {
-                continue;
+            if (!txFilter.isEmpty() && txIndex < txFilter.size()) {
+                int validationCode = txFilter.byteAt(txIndex);
+                if (TxValidationCode.forNumber(validationCode) != TxValidationCode.VALID) {
+                    continue;
+                }
             }
-            if (!tx.hasTransactionActions()) {
-                continue;
-            }
 
-            FilteredTransactionActions actions = tx.getTransactionActions();
-            List<FilteredChaincodeAction> chaincodeActions = actions.getChaincodeActionsList();
-            for (int actionIndex = 0; actionIndex < chaincodeActions.size(); actionIndex++) {
-                if (blockNumber == lastEventBlock
-                        && txIndex == lastEventTxIndex
-                        && actionIndex <= lastEventActionIndex) {
+            try {
+                Envelope envelope = Envelope.parseFrom(txs.get(txIndex));
+                Payload payload = Payload.parseFrom(envelope.getPayload());
+                if (!payload.hasHeader()) {
                     continue;
                 }
 
-                FilteredChaincodeAction action = chaincodeActions.get(actionIndex);
-                if (action == null || !action.hasChaincodeEvent()) {
+                ChannelHeader channelHeader = ChannelHeader.parseFrom(payload.getHeader().getChannelHeader());
+                if (channelHeader.getType() != HeaderType.ENDORSER_TRANSACTION_VALUE) {
                     continue;
                 }
 
-                ChaincodeEvent event = action.getChaincodeEvent();
-                if (!runConfig.chaincodeName.equals(event.getChaincodeId())) {
-                    continue;
-                }
-                if (!("SubmitOp::" + docId).equals(event.getEventName())) {
-                    continue;
-                }
+                Transaction tx = Transaction.parseFrom(payload.getData());
+                List<TransactionAction> actions = tx.getActionsList();
+                for (int actionIndex = 0; actionIndex < actions.size(); actionIndex++) {
+                    if (blockNumber == lastEventBlock
+                            && txIndex == lastEventTxIndex
+                            && actionIndex <= lastEventActionIndex) {
+                        continue;
+                    }
 
-                OperationRecord record = gson.fromJson(
-                        new String(event.getPayload().toByteArray(), StandardCharsets.UTF_8),
-                        OperationRecord.class);
-                if (record != null && record.getDocId() != null && !record.getDocId().equals(docId)) {
-                    continue;
+                    TransactionAction action = actions.get(actionIndex);
+                    ChaincodeActionPayload actionPayload = ChaincodeActionPayload.parseFrom(action.getPayload());
+                    if (!actionPayload.hasAction()) {
+                        continue;
+                    }
+
+                    ProposalResponsePayload responsePayload = ProposalResponsePayload.parseFrom(
+                            actionPayload.getAction().getProposalResponsePayload());
+                    ChaincodeAction chaincodeAction = ChaincodeAction.parseFrom(responsePayload.getExtension());
+                    if (chaincodeAction.getEvents().isEmpty()) {
+                        continue;
+                    }
+
+                    ChaincodeEvent event = ChaincodeEvent.parseFrom(chaincodeAction.getEvents());
+                    if (!runConfig.chaincodeName.equals(event.getChaincodeId())) {
+                        continue;
+                    }
+                    if (!("SubmitOp::" + docId).equals(event.getEventName())) {
+                        continue;
+                    }
+
+                    byte[] payloadBytes = event.getPayload().toByteArray();
+                    if (payloadBytes.length == 0) {
+                        continue;
+                    }
+
+                    OperationRecord record = gson.fromJson(
+                            new String(payloadBytes, StandardCharsets.UTF_8),
+                            OperationRecord.class);
+                    if (record != null && record.getDocId() != null && !record.getDocId().equals(docId)) {
+                        continue;
+                    }
+                    applyCommittedRecordFromEvent(record, blockNumber, txIndex, actionIndex);
                 }
-                applyCommittedRecordFromEvent(record, blockNumber, txIndex, actionIndex);
+            } catch (Exception e) {
+                System.out.println("Block parse failed: " + e.getMessage());
             }
         }
     }
@@ -641,19 +688,19 @@ public final class App {
             value = scanner.nextLine();
         }
 
-        Operation op = new Operation(
-                UUID.randomUUID().toString(),
-                clientId,
-                type,
-                pos,
-                value,
-                Instant.now().toEpochMilli(),
-                0);
-
         try {
+            Operation op = new Operation(
+                    UUID.randomUUID().toString(),
+                    clientId,
+                    type,
+                    pos,
+                    value,
+                    Instant.now().toEpochMilli(),
+                    0);
             localView = OTEngine.apply(localView, op);
             localPending.add(op);
-            System.out.println("Added to local pending, op_id=" + op.getOpId());
+            System.out.println("Staged locally: type=" + op.getType() + ", pos=" + op.getPosition()
+                    + ", value='" + op.getValue() + "'");
         } catch (Exception e) {
             System.out.println("Failed to apply operation locally: " + e.getMessage());
         }
@@ -682,7 +729,7 @@ public final class App {
             }
 
             // Attach the current ack count so the chaincode can trim the sender's buffer.
-            Operation candidateForSubmit = withAck(candidate, localAck);
+            Operation candidateForSubmit = withAck(candidate, localAck, !cursorAttachedToLedger);
 
             try {
                 contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
@@ -690,6 +737,7 @@ public final class App {
                 System.out.println("Tx successfully sent, op_id=" + candidateForSubmit.getOpId() + ", ack=" + localAck);
                 // Reset ack after a successful submission.
                 localAck = 0;
+                cursorAttachedToLedger = true;
                 return;
             } catch (Exception e) {
                 if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
@@ -970,20 +1018,16 @@ public final class App {
         if (record == null || record.getOperation() == null) {
             return;
         }
-        String opId = record.getOperation().getOpId();
-        if (opId != null && committedOpIds.contains(opId)) {
-            return;
-        }
 
-        Operation transformed = serverRec(record.getOperation());
+        Operation transformed = serverRec(record.getOperation(), blockNumber, txIndex, actionIndex);
         List<Operation> transformedBlockOps = new ArrayList<>();
         transformedBlockOps.add(transformed);
 
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
         clientRec(transformedBlockOps);
         tryCreateSnapshot();
-        System.out.println("Synced from filtered block=" + blockNumber
-                + ", version=" + chainState.getVersion() + ", opId=" + opId);
+        System.out.println("Synced from block=" + blockNumber
+                + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
     }
 
 
@@ -999,15 +1043,15 @@ public final class App {
      * <li>Transform {@code incoming} against every op remaining in the sender's
      * buffer (ops the sender had not yet seen when it produced this op),
      * and symmetrically update those buffer entries.</li>
-     * <li>Apply the fully-transformed op to {@code committedView} and append it
-     * to {@code committedHistory}.</li>
+    * <li>Apply the fully-transformed op to {@code committedView}.</li>
      * <li>Distribute the transformed op to all other known clients' buffers so
      * their future submissions can be transformed correctly.</li>
      * </ol>
      *
      * @return the fully-transformed version of {@code incomingRaw}
      */
-    private Operation serverRec(final Operation incomingRaw) {
+    private Operation serverRec(final Operation incomingRaw, final long blockNumber, final int txIndex,
+            final int actionIndex) {
         String senderId = incomingRaw.getClientId();
         if (senderId == null || senderId.isEmpty()) {
             senderId = "unknown";
@@ -1017,7 +1061,7 @@ public final class App {
 
         // Trim the sender's buffer: the ack value tells us how many remote ops
         // the sender had already seen when it produced this operation.
-        List<Operation> senderBuffer = getClientBuffer(senderId);
+        List<Operation> senderBuffer = getClientBuffer(senderId, incomingRaw);
         int ack = normalizeAck(incomingRaw.getAck(), senderBuffer.size());
         if (ack > 0) {
             senderBuffer.subList(0, ack).clear();
@@ -1036,11 +1080,8 @@ public final class App {
             incoming = incomingPrime;
         }
 
+
         committedView = OTEngine.apply(committedView, incoming);
-        committedHistory.add(incoming);
-        if (incoming.getOpId() != null) {
-            committedOpIds.add(incoming.getOpId());
-        }
         lastSyncedVersion++;
 
         // Broadcast the transformed op to every other client's buffer.
@@ -1115,52 +1156,179 @@ public final class App {
     // -------------------------------------------------------------------------
 
     private List<Operation> getClientBuffer(final String targetClientId) {
-        return clientBuffers.computeIfAbsent(targetClientId, this::buildInitialBufferForClient);
+        return clientBuffers.computeIfAbsent(targetClientId, id -> buildInitialBufferForClient(id, null));
+    }
+
+    private List<Operation> getClientBuffer(final String targetClientId, final Operation referenceOp) {
+        return clientBuffers.computeIfAbsent(targetClientId, id -> buildInitialBufferForClient(id, referenceOp));
     }
 
     /**
-     * Builds an initial buffer for a newly-seen client by replaying committed
-     * history.
-     * The buffer contains the ops that the target client had not yet acknowledged
-     * (based on the {@code ack} value of its most recent committed op).
+     * Builds an initial buffer for a newly-seen client by reloading ledger ops
+     * after the cursor stored in the first submitted op.
      */
-    private List<Operation> buildInitialBufferForClient(final String targetClientId) {
-        // Find how many remote ops this client had already seen (its last ack value).
-        long ackToSkip = 0;
-        for (int i = committedHistory.size() - 1; i >= 0; i--) {
-            Operation op = committedHistory.get(i);
-            if (op.getClientId() != null && op.getClientId().equals(targetClientId)) {
-                ackToSkip = op.getAck();
-                break;
-            }
-        }
-
-        // Collect all committed ops from other clients, skipping the first ackToSkip.
-        long skipped = 0;
+    private List<Operation> buildInitialBufferForClient(final String targetClientId, final Operation referenceOp) {
+        long cursorBlock = referenceOp == null ? -1L : referenceOp.getLastEventBlock();
+        int cursorTxIndex = referenceOp == null ? -1 : referenceOp.getLastEventTxIndex();
+        int cursorActionIndex = referenceOp == null ? -1 : referenceOp.getLastEventActionIndex();
         List<Operation> initial = new ArrayList<>();
-        for (Operation committed : committedHistory) {
-            if (committed.getClientId() != null && committed.getClientId().equals(targetClientId)) {
-                continue;
+        try {
+            long upperBound = lastEventBlock;
+            if (cursorBlock < 0 || upperBound < cursorBlock) {
+                return initial;
             }
-            if (skipped < ackToSkip) {
-                skipped++;
-                continue;
+
+            try (var events = network
+                    .newBlockEventsRequest()
+                    .startBlock(cursorBlock)
+                    .build()
+                    .getEvents()) {
+                while (events.hasNext()) {
+                    Block block = events.next();
+                    if (block == null) {
+                        continue;
+                    }
+
+                    long blockNumber = block.getHeader().getNumber();
+                    if (blockNumber > upperBound) {
+                        break;
+                    }
+
+                    List<ByteString> txs = block.getData().getDataList();
+                    ByteString txFilter = ByteString.EMPTY;
+                    if (block.hasMetadata()
+                            && block.getMetadata().getMetadataCount() > BlockMetadataIndex.TRANSACTIONS_FILTER_VALUE) {
+                        txFilter = block.getMetadata().getMetadataList().get(BlockMetadataIndex.TRANSACTIONS_FILTER_VALUE);
+                    }
+
+                    for (int txIndex = 0; txIndex < txs.size(); txIndex++) {
+                        if (blockNumber == cursorBlock && txIndex < cursorTxIndex) {
+                            continue;
+                        }
+
+                        if (!txFilter.isEmpty() && txIndex < txFilter.size()) {
+                            int validationCode = txFilter.byteAt(txIndex);
+                            if (TxValidationCode.forNumber(validationCode) != TxValidationCode.VALID) {
+                                continue;
+                            }
+                        }
+
+                        try {
+                            Envelope envelope = Envelope.parseFrom(txs.get(txIndex));
+                            Payload payload = Payload.parseFrom(envelope.getPayload());
+                            if (!payload.hasHeader()) {
+                                continue;
+                            }
+
+                            ChannelHeader channelHeader = ChannelHeader.parseFrom(payload.getHeader().getChannelHeader());
+                            if (channelHeader.getType() != HeaderType.ENDORSER_TRANSACTION_VALUE) {
+                                continue;
+                            }
+
+                            Transaction tx = Transaction.parseFrom(payload.getData());
+                            List<TransactionAction> actions = tx.getActionsList();
+                            for (int actionIndex = 0; actionIndex < actions.size(); actionIndex++) {
+                                if (blockNumber == cursorBlock
+                                        && txIndex == cursorTxIndex
+                                        && actionIndex <= cursorActionIndex) {
+                                    continue;
+                                }
+
+                                TransactionAction action = actions.get(actionIndex);
+                                ChaincodeActionPayload actionPayload = ChaincodeActionPayload.parseFrom(action.getPayload());
+                                if (!actionPayload.hasAction()) {
+                                    continue;
+                                }
+
+                                ProposalResponsePayload responsePayload = ProposalResponsePayload.parseFrom(
+                                        actionPayload.getAction().getProposalResponsePayload());
+                                ChaincodeAction chaincodeAction = ChaincodeAction.parseFrom(responsePayload.getExtension());
+                                if (chaincodeAction.getEvents().isEmpty()) {
+                                    continue;
+                                }
+
+                                ChaincodeEvent event = ChaincodeEvent.parseFrom(chaincodeAction.getEvents());
+                                if (!runConfig.chaincodeName.equals(event.getChaincodeId())) {
+                                    continue;
+                                }
+                                if (!("SubmitOp::" + docId).equals(event.getEventName())) {
+                                    continue;
+                                }
+
+                                byte[] payloadBytes = event.getPayload().toByteArray();
+                                if (payloadBytes.length == 0) {
+                                    continue;
+                                }
+
+                                OperationRecord record = gson.fromJson(
+                                        new String(payloadBytes, StandardCharsets.UTF_8),
+                                        OperationRecord.class);
+                                if (record == null || record.getOperation() == null) {
+                                    continue;
+                                }
+
+                                Operation committed = record.getOperation();
+                                if (committed.getClientId() != null && committed.getClientId().equals(targetClientId)) {
+                                    continue;
+                                }
+                                initial.add(committed);
+                            }
+                        } catch (Exception e) {
+                            System.out.println("Block parse failed: " + e.getMessage());
+                        }
+                    }
+                }
             }
-            initial.add(committed);
+        } catch (Exception e) {
+            System.out.println("Failed to rebuild client buffer from ledger: " + e.getMessage());
         }
         return initial;
     }
 
+    private boolean isAfterCursor(final Operation op, final long cursorBlock, final int cursorTxIndex,
+            final int cursorActionIndex) {
+        if (op == null) {
+            return false;
+        }
+        if (op.getLastEventBlock() > cursorBlock) {
+            return true;
+        }
+        if (op.getLastEventBlock() < cursorBlock) {
+            return false;
+        }
+        if (op.getLastEventTxIndex() > cursorTxIndex) {
+            return true;
+        }
+        if (op.getLastEventTxIndex() < cursorTxIndex) {
+            return false;
+        }
+        return op.getLastEventActionIndex() > cursorActionIndex;
+    }
+
     /** Returns a copy of {@code op} with the given {@code ack} value attached. */
-    private Operation withAck(final Operation op, final long ack) {
-        return new Operation(
-                op.getOpId(),
-                op.getClientId(),
-                op.getType(),
-                op.getPosition(),
-                op.getValue(),
-                op.getTimestamp(),
-                ack);
+    private Operation withAck(final Operation op, final long ack, final boolean includeCursor) {
+        if (includeCursor) {
+            return new Operation(
+                    op.getOpId(),
+                    op.getClientId(),
+                    op.getType(),
+                    op.getPosition(),
+                    op.getValue(),
+                    op.getTimestamp(),
+                    ack,
+                    lastEventBlock,
+                    lastEventTxIndex,
+                    lastEventActionIndex);
+        } else {
+            return new Operation(
+                    op.getOpId(),
+                    op.getClientId(),
+                    op.getType(),
+                    op.getPosition(),
+                    op.getValue(),
+                    op.getTimestamp(),
+                    ack);
+        }
     }
 
     /**

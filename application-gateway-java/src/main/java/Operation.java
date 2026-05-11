@@ -6,14 +6,23 @@ public final class Operation {
         private final String value;
         private final long ack;
         private final long timestamp;
+        private final long lastEventBlock;
+        private final int lastEventTxIndex;
+        private final int lastEventActionIndex;
 
         public Operation(final String opId, final String clientId, final OperationType type, final int position,
                         final String value, final long timestamp) {
-                this(opId, clientId, type, position, value, timestamp, 0);
+                this(opId, clientId, type, position, value, timestamp, 0, -1, -1, -1);
         }
 
         public Operation(final String opId, final String clientId, final OperationType type, final int position,
                         final String value, final long timestamp, final long ack) {
+                this(opId, clientId, type, position, value, timestamp, ack, -1, -1, -1);
+        }
+
+        public Operation(final String opId, final String clientId, final OperationType type, final int position,
+                        final String value, final long timestamp, final long ack, final long lastEventBlock,
+                        final int lastEventTxIndex, final int lastEventActionIndex) {
                 this.opId = opId;
                 this.clientId = clientId;
                 this.type = type;
@@ -21,6 +30,9 @@ public final class Operation {
                 this.value = value;
                 this.ack = ack;
                 this.timestamp = timestamp;
+                this.lastEventBlock = lastEventBlock;
+                this.lastEventTxIndex = lastEventTxIndex;
+                this.lastEventActionIndex = lastEventActionIndex;
         }
 
         public String getOpId() {
@@ -49,5 +61,17 @@ public final class Operation {
 
         public long getTimestamp() {
                 return timestamp;
+        }
+
+        public long getLastEventBlock() {
+                return lastEventBlock;
+        }
+
+        public int getLastEventTxIndex() {
+                return lastEventTxIndex;
+        }
+
+        public int getLastEventActionIndex() {
+                return lastEventActionIndex;
         }
 }

@@ -32,6 +32,15 @@ public final class Operation {
     @Property()
     private final long timestamp;
 
+    @Property()
+    private final long lastEventBlock;
+
+    @Property()
+    private final int lastEventTxIndex;
+
+    @Property()
+    private final int lastEventActionIndex;
+
     public Operation(
             @JsonProperty("opId") final String opId,
             @JsonProperty("clientId") final String clientId,
@@ -40,6 +49,20 @@ public final class Operation {
             @JsonProperty("value") final String value,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("ack") final long ack) {
+        this(opId, clientId, type, position, value, timestamp, ack, -1L, -1, -1);
+    }
+
+    public Operation(
+            @JsonProperty("opId") final String opId,
+            @JsonProperty("clientId") final String clientId,
+            @JsonProperty("type") final OperationType type,
+            @JsonProperty("position") final int position,
+            @JsonProperty("value") final String value,
+            @JsonProperty("timestamp") final long timestamp,
+            @JsonProperty("ack") final long ack,
+            @JsonProperty("lastEventBlock") final long lastEventBlock,
+            @JsonProperty("lastEventTxIndex") final int lastEventTxIndex,
+            @JsonProperty("lastEventActionIndex") final int lastEventActionIndex) {
         this.opId = opId;
         this.clientId = clientId;
         this.type = type;
@@ -47,6 +70,9 @@ public final class Operation {
         this.value = value;
         this.ack = ack;
         this.timestamp = timestamp;
+        this.lastEventBlock = lastEventBlock;
+        this.lastEventTxIndex = lastEventTxIndex;
+        this.lastEventActionIndex = lastEventActionIndex;
     }
 
     public String getOpId() {
@@ -75,5 +101,17 @@ public final class Operation {
 
     public long getTimestamp() {
         return timestamp;
+    }
+
+    public long getLastEventBlock() {
+        return lastEventBlock;
+    }
+
+    public int getLastEventTxIndex() {
+        return lastEventTxIndex;
+    }
+
+    public int getLastEventActionIndex() {
+        return lastEventActionIndex;
     }
 }
