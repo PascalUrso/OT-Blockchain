@@ -1295,7 +1295,7 @@ public final class App {
                     op.getPosition(),
                     op.getValue(),
                     op.getTimestamp(),
-                    ack,
+                    0,
                     lastEventBlock,
                     lastEventTxIndex,
                     lastEventActionIndex);
