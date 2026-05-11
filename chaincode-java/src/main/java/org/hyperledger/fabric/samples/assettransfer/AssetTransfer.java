@@ -39,6 +39,7 @@ public final class AssetTransfer implements ContractInterface {
     private static final String SNAP_PREFIX = "SNAP::";
     private static final String LOG_PREFIX = "LOG::";
     private static final String SNAPSHOT_PREFIX = "SNAPSHOT::";
+    private static final String SNAPSHOT_CHUNK_PREFIX = "SNAPSHOT_CHUNK::";
 
     private final Genson genson = new Genson();
 
@@ -171,6 +172,64 @@ public final class AssetTransfer implements ContractInterface {
         return snapshotKey;
     }
 
+    @Transaction(intent = Transaction.TYPE.SUBMIT)
+    public String SaveSnapshotChunk(final Context ctx,
+                                    final String docId,
+                                    final String snapshotId,
+                                    final int index,
+                                    final int totalChunks,
+                                    final String chunkPayload) {
+        ChaincodeStub stub = ctx.getStub();
+        String marker = stub.getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+        if (snapshotId == null || snapshotId.isEmpty()) {
+            throw new ChaincodeException("snapshotId is required", OTCollabErrors.INVALID_SNAPSHOT.toString());
+        }
+        if (index < 0 || totalChunks <= 0 || index >= totalChunks) {
+            throw new ChaincodeException("Invalid chunk index", OTCollabErrors.INVALID_SNAPSHOT.toString());
+        }
+        String key = snapshotChunkKey(docId, snapshotId, index);
+        stub.putStringState(key, chunkPayload == null ? "" : chunkPayload);
+        return key;
+    }
+
+    @Transaction(intent = Transaction.TYPE.SUBMIT)
+    public String CommitSnapshotPointer(final Context ctx, final String docId, final String pointerJson) {
+        ChaincodeStub stub = ctx.getStub();
+        String marker = stub.getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+
+        SnapshotPointer pointer = genson.deserialize(pointerJson, SnapshotPointer.class);
+        if (pointer == null || pointer.getDocId() == null || !docId.equals(pointer.getDocId())) {
+            throw new ChaincodeException("Invalid snapshot pointer", OTCollabErrors.INVALID_SNAPSHOT.toString());
+        }
+        if (!pointer.isChunked() || pointer.getTotalChunks() <= 0) {
+            throw new ChaincodeException("Invalid snapshot pointer", OTCollabErrors.INVALID_SNAPSHOT.toString());
+        }
+
+        String snapshotKey = snapshotKey(docId);
+        String existingJson = stub.getStringState(snapshotKey);
+        if (existingJson != null && !existingJson.isEmpty()) {
+            try {
+                SnapshotPointer existing = genson.deserialize(existingJson, SnapshotPointer.class);
+                if (existing != null && existing.isChunked() && pointer.getVersion() <= existing.getVersion()) {
+                    throw new ChaincodeException(
+                            "Stale snapshot version: " + pointer.getVersion(),
+                            OTCollabErrors.INVALID_SNAPSHOT.toString());
+                }
+            } catch (Exception ignore) {
+                // Existing value might be a full snapshot JSON; ignore and overwrite.
+            }
+        }
+
+        stub.putStringState(snapshotKey, genson.serialize(pointer));
+        return snapshotKey;
+    }
+
     @Transaction(intent = Transaction.TYPE.EVALUATE)
     public String GetLatestSnapshot(final Context ctx, final String docId) {
         ChaincodeStub stub = ctx.getStub();
@@ -180,7 +239,25 @@ public final class AssetTransfer implements ContractInterface {
         }
 
         String snapshotJson = stub.getStringState(snapshotKey(docId));
-        return snapshotJson == null ? "" : snapshotJson;
+        if (snapshotJson == null || snapshotJson.isEmpty()) {
+            return "";
+        }
+
+        try {
+            SnapshotPointer pointer = genson.deserialize(snapshotJson, SnapshotPointer.class);
+            if (pointer != null && pointer.isChunked() && pointer.getTotalChunks() > 0) {
+                StringBuilder builder = new StringBuilder();
+                for (int i = 0; i < pointer.getTotalChunks(); i++) {
+                    String chunk = stub.getStringState(snapshotChunkKey(docId, pointer.getSnapshotId(), i));
+                    builder.append(chunk == null ? "" : chunk);
+                }
+                return builder.toString();
+            }
+        } catch (Exception ignore) {
+            // Fall through to legacy full snapshot JSON.
+        }
+
+        return snapshotJson;
     }
 
     private boolean exists(final ChaincodeStub stub, final String key) {
@@ -194,6 +271,10 @@ public final class AssetTransfer implements ContractInterface {
 
     private String snapshotKey(final String docId) {
         return SNAPSHOT_PREFIX + docId;
+    }
+
+    private String snapshotChunkKey(final String docId, final String snapshotId, final int index) {
+        return String.format("%s%s::%s::%06d", SNAPSHOT_CHUNK_PREFIX, docId, snapshotId, index);
     }
 
     private String logKey(final String docId, final long submittedTs, final String txId, final String opId) {

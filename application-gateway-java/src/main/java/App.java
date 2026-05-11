@@ -82,9 +82,10 @@ public final class App {
     /** CLI flag that replays a recorded operation log against the ledger. */
     private static final String REPLAY_LOG_ARG = "--replay-log";
 
-    /** Frequency of creating snapshots. */
+    /** Parameters of creating snapshots. */
     private static final int SNAPSHOT_TRIGGER_OPS = 100;
     private static final long SNAPSHOT_TRIGGER_MS = 60_000L;
+    private static final int SNAPSHOT_CHUNK_SIZE = 900_000;
 
     // -------------------------------------------------------------------------
     // Infrastructure
@@ -328,7 +329,7 @@ public final class App {
         while (true) {
             printStatus();
             System.out.println("\n1) INSERT(local pending)  2) DELETE(local pending)  3) UPDATE(local pending)");
-            System.out.println("4) submit 1 local pending  5) submit all local pending  6) manually sync via events");
+            System.out.println("4) submit 1 local pending  5) submit all local pending  6) manually sync with chain and save snapshot");
             System.out.println("7) view all committed ops  8) exit");
             System.out.print("select: ");
             if (!scanner.hasNextLine()) {
@@ -353,6 +354,13 @@ public final class App {
                     break;
                 case "6":
                     manualEventSync();
+                    try {
+                        saveSnapshotToChain();
+                        lastSnapshotVersion = lastSyncedVersion;
+                        lastSnapshotTimeMs =  System.currentTimeMillis();
+                    } catch (Exception e) {
+                        System.out.println("Snapshot save failed: " + e.getMessage());
+                    }
                     break;
                 case "7":
                     List<OperationRecord> allOps = queryAllOps();
@@ -484,7 +492,7 @@ public final class App {
             lastSyncedVersion = snapshot.version;
             chainState = new DocumentState(docId, committedView, lastSyncedVersion);
             lastSnapshotVersion = snapshot.version;
-            lastSnapshotTimeMs = snapshot.timestamp;
+            lastSnapshotTimeMs =  System.currentTimeMillis();
             lastEventBlock = snapshot.lastBlockNumber;
             lastEventTxIndex = snapshot.lastEventTxIndex;
             lastEventActionIndex = snapshot.lastEventActionIndex;
@@ -1134,7 +1142,24 @@ public final class App {
         snapshot.clientBuffers = new HashMap<>(clientBuffers);
         snapshot.knownClients = new HashSet<>(knownClients);
 
-        contract.submitTransaction("SaveSnapshot", docId, gson.toJson(snapshot));
+        String snapshotJson = gson.toJson(snapshot);
+        List<String> chunks = splitIntoChunks(snapshotJson, SNAPSHOT_CHUNK_SIZE);
+        for (int i = 0; i < chunks.size(); i++) {
+            contract.submitTransaction("SaveSnapshotChunk",
+                    docId,
+                    snapshot.snapshotId,
+                    String.valueOf(i),
+                    String.valueOf(chunks.size()),
+                    chunks.get(i));
+        }
+
+        SnapshotPointer pointer = new SnapshotPointer(
+                snapshot.docId,
+                snapshot.snapshotId,
+                snapshot.version,
+                snapshot.timestamp,
+                chunks.size());
+        contract.submitTransaction("CommitSnapshotPointer", docId, gson.toJson(pointer));
         System.out.println("Snapshot saved: version=" + snapshot.version);
     }
 
@@ -1361,6 +1386,21 @@ public final class App {
         return a != null && b != null
                 && a.getClientId() != null
                 && a.getClientId().equals(b.getClientId());
+    }
+
+    private List<String> splitIntoChunks(final String payload, final int chunkSize) {
+        List<String> chunks = new ArrayList<>();
+        if (payload == null || payload.isEmpty()) {
+            chunks.add("");
+            return chunks;
+        }
+        int offset = 0;
+        while (offset < payload.length()) {
+            int end = Math.min(payload.length(), offset + chunkSize);
+            chunks.add(payload.substring(offset, end));
+            offset = end;
+        }
+        return chunks;
     }
 
     // -------------------------------------------------------------------------
