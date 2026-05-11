@@ -1285,26 +1285,6 @@ public final class App {
         return initial;
     }
 
-    private boolean isAfterCursor(final Operation op, final long cursorBlock, final int cursorTxIndex,
-            final int cursorActionIndex) {
-        if (op == null) {
-            return false;
-        }
-        if (op.getLastEventBlock() > cursorBlock) {
-            return true;
-        }
-        if (op.getLastEventBlock() < cursorBlock) {
-            return false;
-        }
-        if (op.getLastEventTxIndex() > cursorTxIndex) {
-            return true;
-        }
-        if (op.getLastEventTxIndex() < cursorTxIndex) {
-            return false;
-        }
-        return op.getLastEventActionIndex() > cursorActionIndex;
-    }
-
     /** Returns a copy of {@code op} with the given {@code ack} value attached. */
     private Operation withAck(final Operation op, final long ack, final boolean includeCursor) {
         if (includeCursor) {
