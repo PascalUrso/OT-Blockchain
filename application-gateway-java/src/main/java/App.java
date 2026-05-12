@@ -228,7 +228,7 @@ public final class App {
     private boolean cursorAttachedToLedger;
 
     /** Next sequence number to assign for this client. */
-    private long LocalSeq;
+    private long localSeq;
 
     /** Buffer for out-of-order ops by client sequence. */
     private final Map<String, Map<Long, PendingOp>> pendingByClient = new HashMap<>();
@@ -259,15 +259,11 @@ public final class App {
     private static final class PendingOp {
         private final Operation op;
         private final long blockNumber;
-        private final int txIndex;
-        private final int actionIndex;
         private final long enqueueTimeMs;
 
-        private PendingOp(final Operation op, final long blockNumber, final int txIndex, final int actionIndex) {
+        private PendingOp(final Operation op, final long blockNumber) {
             this.op = op;
             this.blockNumber = blockNumber;
-            this.txIndex = txIndex;
-            this.actionIndex = actionIndex;
             this.enqueueTimeMs = System.currentTimeMillis();
         }
     }
@@ -478,7 +474,7 @@ public final class App {
             // Document was already created by another client — nothing to do.
         }
         localAck = 0;
-        LocalSeq = queryClientSeqFromWorldState();
+        localSeq = queryClientSeqFromWorldState();
         localClock = 0;
         cursorAttachedToLedger = false;
         localPending.clear();
@@ -498,7 +494,6 @@ public final class App {
             lastEventBlock = 0;
             rebuildCommittedFromLedger();
         }
-        syncLocalSeqFromWorldState();
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
     }
@@ -767,7 +762,7 @@ public final class App {
             }
 
             //long seq = queryClientSeqFromWorldState();
-            Operation candidateForSubmit = withAckAndSeq(candidate, localAck, LocalSeq, !cursorAttachedToLedger);
+            Operation candidateForSubmit = withAckAndSeq(candidate, localAck, localSeq, !cursorAttachedToLedger);
 
             try {
                 contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
@@ -776,7 +771,7 @@ public final class App {
                 // Reset ack after a successful submission.
                 localAck = 0;
                 cursorAttachedToLedger = true;
-                LocalSeq += 1;
+                localSeq += 1;
                 return;
             } catch (Exception e) {
                 if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
@@ -1098,8 +1093,7 @@ public final class App {
      *
      * @return the fully-transformed version of {@code incomingRaw}
      */
-    private Operation serverRecOne(final Operation incomingRaw, final long blockNumber, final int txIndex,
-            final int actionIndex) {
+    private Operation serverRecOne(final Operation incomingRaw, final long blockNumber) {
         String senderId = incomingRaw.getClientId();
         if (senderId == null || senderId.isEmpty()) {
             senderId = "unknown";
@@ -1464,7 +1458,7 @@ public final class App {
 
         List<PendingOp> expired = extractExpiredPendingOps();
         for (PendingOp op : expired) {
-            ordered.add(serverRecOne(op.op, op.blockNumber, op.txIndex, op.actionIndex));
+            ordered.add(serverRecOne(op.op, op.blockNumber));
         }
 
         String senderId = incoming.getClientId();
@@ -1474,15 +1468,15 @@ public final class App {
 
         long seq = incoming.getClientSeq();
         if (seq < 0) {
-            ordered.add(serverRecOne(incoming, blockNumber, txIndex, actionIndex));
+            ordered.add(serverRecOne(incoming, blockNumber));
             return ordered;
         }
 
         long expected = knownClients.getOrDefault(senderId, 0L);
         if (seq > expected) {
-            pendingByClient
+                pendingByClient
                     .computeIfAbsent(senderId, id -> new HashMap<>())
-                    .putIfAbsent(seq, new PendingOp(incoming, blockNumber, txIndex, actionIndex));
+                    .putIfAbsent(seq, new PendingOp(incoming, blockNumber));
             return ordered;
         }
 
@@ -1491,11 +1485,11 @@ public final class App {
         }
 
         Map<Long, PendingOp> pending = pendingByClient.computeIfAbsent(senderId, id -> new HashMap<>());
-        PendingOp current = new PendingOp(incoming, blockNumber, txIndex, actionIndex);
+        PendingOp current = new PendingOp(incoming, blockNumber);
         long next = expected;
         while (current != null) {
             knownClients.put(senderId, next + 1);
-            ordered.add(serverRecOne(current.op, current.blockNumber, current.txIndex, current.actionIndex));
+            ordered.add(serverRecOne(current.op, current.blockNumber));
             next++;
             current = pending.remove(next);
         }
