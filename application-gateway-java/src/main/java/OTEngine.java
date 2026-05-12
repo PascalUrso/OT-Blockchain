@@ -133,8 +133,18 @@ public final class OTEngine {
     }
 
     private static Operation withPosition(final Operation op, final int pos) {
-        return new Operation(op.getOpId(), op.getClientId(), op.getType(), pos, op.getValue(),
-            op.getTimestamp(), op.getAck());
+        return new Operation(
+            op.getOpId(),
+            op.getClientId(),
+            op.getType(),
+            pos,
+            op.getValue(),
+            op.getTimestamp(),
+            op.getAck(),
+            op.getClientSeq(),
+            op.getLastEventBlock(),
+            op.getLastEventTxIndex(),
+            op.getLastEventActionIndex());
     }
 
     private static Operation toNoop(final Operation op) {

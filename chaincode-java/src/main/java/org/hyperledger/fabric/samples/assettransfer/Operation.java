@@ -30,6 +30,9 @@ public final class Operation {
     private final long ack;
 
     @Property()
+    private final long clientSeq;
+
+    @Property()
     private final long timestamp;
 
     @Property()
@@ -49,7 +52,7 @@ public final class Operation {
             @JsonProperty("value") final String value,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("ack") final long ack) {
-        this(opId, clientId, type, position, value, timestamp, ack, -1L, -1, -1);
+        this(opId, clientId, type, position, value, timestamp, ack, -1, -1L, -1, -1);
     }
 
     public Operation(
@@ -60,6 +63,7 @@ public final class Operation {
             @JsonProperty("value") final String value,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("ack") final long ack,
+            @JsonProperty("clientSeq") final long clientSeq,
             @JsonProperty("lastEventBlock") final long lastEventBlock,
             @JsonProperty("lastEventTxIndex") final int lastEventTxIndex,
             @JsonProperty("lastEventActionIndex") final int lastEventActionIndex) {
@@ -69,6 +73,7 @@ public final class Operation {
         this.position = position;
         this.value = value;
         this.ack = ack;
+        this.clientSeq = clientSeq;
         this.timestamp = timestamp;
         this.lastEventBlock = lastEventBlock;
         this.lastEventTxIndex = lastEventTxIndex;
@@ -97,6 +102,10 @@ public final class Operation {
 
     public long getAck() {
         return ack;
+    }
+
+    public long getClientSeq() {
+        return clientSeq;
     }
 
     public long getTimestamp() {

@@ -40,6 +40,7 @@ public final class AssetTransfer implements ContractInterface {
     private static final String LOG_PREFIX = "LOG::";
     private static final String SNAPSHOT_PREFIX = "SNAPSHOT::";
     private static final String SNAPSHOT_CHUNK_PREFIX = "SNAPSHOT_CHUNK::";
+    private static final String CLIENT_SEQ_PREFIX = "CLIENT_SEQ::";
 
     private final Genson genson = new Genson();
 
@@ -85,6 +86,18 @@ public final class AssetTransfer implements ContractInterface {
             throw new ChaincodeException("type is required", OTCollabErrors.INVALID_OPERATION.toString());
         }
 
+        // Enforce per-client sequence from world state to maintain client ordering.
+        String seqKey = clientSeqKey(docId, op.getClientId());
+        long currentSeq = parseLongOrDefault(stub.getStringState(seqKey), 0L);
+        if (op.getClientSeq() < 0) {
+            throw new ChaincodeException("clientSeq is required", OTCollabErrors.INVALID_OPERATION.toString());
+        }
+        if (op.getClientSeq() < currentSeq) {
+            throw new ChaincodeException("clientSeq out of date", OTCollabErrors.INVALID_OPERATION.toString());
+        }
+
+        stub.putStringState(seqKey, String.valueOf(op.getClientSeq() + 1));
+
         // Do not read operation range here to avoid PHANTOM_READ_CONFLICT under concurrent submits.
         // Ordering and transform are handled client-side per committed block.
         long committedOrder = op.getTimestamp();
@@ -98,7 +111,11 @@ public final class AssetTransfer implements ContractInterface {
             op.getPosition(),
             op.getValue(),
             op.getTimestamp(),
-            op.getAck());
+            op.getAck(),
+            op.getClientSeq(),
+            -1L,
+            -1,
+            -1);
         OperationRecord record = new OperationRecord(docId, committedOp, committedOrder, stub.getTxId());
 
         // Write to operation log (append-only key, no shared-key write conflict)
@@ -260,6 +277,20 @@ public final class AssetTransfer implements ContractInterface {
         return snapshotJson;
     }
 
+    @Transaction(intent = Transaction.TYPE.EVALUATE)
+    public String GetClientSeq(final Context ctx, final String docId, final String clientId) {
+        ChaincodeStub stub = ctx.getStub();
+        String marker = stub.getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+        if (clientId == null || clientId.isEmpty()) {
+            throw new ChaincodeException("clientId is required", OTCollabErrors.INVALID_OPERATION.toString());
+        }
+        String value = stub.getStringState(clientSeqKey(docId, clientId));
+        return value == null ? "0" : value;
+    }
+
     private boolean exists(final ChaincodeStub stub, final String key) {
         String value = stub.getStringState(key);
         return value != null && !value.isEmpty();
@@ -275,6 +306,21 @@ public final class AssetTransfer implements ContractInterface {
 
     private String snapshotChunkKey(final String docId, final String snapshotId, final int index) {
         return String.format("%s%s::%s::%06d", SNAPSHOT_CHUNK_PREFIX, docId, snapshotId, index);
+    }
+
+    private String clientSeqKey(final String docId, final String clientId) {
+        return String.format("%s%s::%s", CLIENT_SEQ_PREFIX, docId, clientId);
+    }
+
+    private long parseLongOrDefault(final String value, final long fallback) {
+        if (value == null || value.isEmpty()) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     private String logKey(final String docId, final long submittedTs, final String txId, final String opId) {

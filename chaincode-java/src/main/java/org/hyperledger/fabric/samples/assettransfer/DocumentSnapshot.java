@@ -6,7 +6,7 @@ package org.hyperledger.fabric.samples.assettransfer;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.Map;
 
 import org.hyperledger.fabric.contract.annotation.DataType;
 import org.hyperledger.fabric.contract.annotation.Property;
@@ -43,7 +43,7 @@ public final class DocumentSnapshot {
     private final Map<String, List<Operation>> clientBuffers;
 
     @Property()
-    private final Set<String> knownClients;
+    private final Map<String, Long> knownClients;
 
     public DocumentSnapshot(
             @JsonProperty("snapshotId") final String snapshotId,
@@ -55,7 +55,7 @@ public final class DocumentSnapshot {
             @JsonProperty("lastEventActionIndex") final int lastEventActionIndex,
             @JsonProperty("committedView") final String committedView,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
-            @JsonProperty("knownClients") final Set<String> knownClients) {
+            @JsonProperty("knownClients") final Map<String, Long> knownClients) {
         this.snapshotId = snapshotId;
         this.docId = docId;
         this.version = version;
@@ -106,7 +106,7 @@ public final class DocumentSnapshot {
         return clientBuffers;
     }
 
-    public Set<String> getKnownClients() {
+    public Map<String, Long> getKnownClients() {
         return knownClients;
     }
 }

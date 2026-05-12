@@ -86,6 +86,7 @@ public final class App {
     private static final int SNAPSHOT_TRIGGER_OPS = 100;
     private static final long SNAPSHOT_TRIGGER_MS = 60_000L;
     private static final int SNAPSHOT_CHUNK_SIZE = 900_000;
+    private static final long PENDING_OP_TTL_MS = 60_000L;
 
     // -------------------------------------------------------------------------
     // Infrastructure
@@ -205,7 +206,7 @@ public final class App {
      * Set of all client IDs seen so far; used to broadcast incoming ops to all
      * peers.
      */
-    private final Set<String> knownClients = new HashSet<>();
+    private final Map<String, Long> knownClients = new HashMap<>();
 
     /**
      * Operations staged locally but not yet confirmed on-chain.
@@ -225,6 +226,12 @@ public final class App {
 
     /** True after the first submitted operation has carried the cursor metadata. */
     private boolean cursorAttachedToLedger;
+
+    /** Next sequence number to assign for this client. */
+    private long LocalSeq;
+
+    /** Buffer for out-of-order ops by client sequence. */
+    private final Map<String, Map<Long, PendingOp>> pendingByClient = new HashMap<>();
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -246,6 +253,22 @@ public final class App {
             this.type = type;
             this.position = position;
             this.value = value;
+        }
+    }
+
+    private static final class PendingOp {
+        private final Operation op;
+        private final long blockNumber;
+        private final int txIndex;
+        private final int actionIndex;
+        private final long enqueueTimeMs;
+
+        private PendingOp(final Operation op, final long blockNumber, final int txIndex, final int actionIndex) {
+            this.op = op;
+            this.blockNumber = blockNumber;
+            this.txIndex = txIndex;
+            this.actionIndex = actionIndex;
+            this.enqueueTimeMs = System.currentTimeMillis();
         }
     }
 
@@ -455,6 +478,7 @@ public final class App {
             // Document was already created by another client — nothing to do.
         }
         localAck = 0;
+        LocalSeq = queryClientSeqFromWorldState();
         localClock = 0;
         cursorAttachedToLedger = false;
         localPending.clear();
@@ -467,12 +491,14 @@ public final class App {
             lastSyncedVersion = chainState.getVersion();
             localView = committedView;
             knownClients.clear();
-            knownClients.add(clientId);
+            knownClients.put(clientId, 0L);
+            
             clientBuffers.clear();
             clientBuffers.put(clientId, new ArrayList<>());
             lastEventBlock = 0;
             rebuildCommittedFromLedger();
         }
+        syncLocalSeqFromWorldState();
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
     }
@@ -498,10 +524,10 @@ public final class App {
             lastEventActionIndex = snapshot.lastEventActionIndex;
 
             knownClients.clear();
-            knownClients.add(clientId);
             if (snapshot.knownClients != null) {
-                knownClients.addAll(snapshot.knownClients);
+                knownClients.putAll(snapshot.knownClients);
             }
+            knownClients.putIfAbsent(clientId, 0L);
 
             clientBuffers.clear();
             if (snapshot.clientBuffers != null) {
@@ -698,13 +724,17 @@ public final class App {
 
         try {
             Operation op = new Operation(
-                    UUID.randomUUID().toString(),
-                    clientId,
-                    type,
-                    pos,
-                    value,
-                    Instant.now().toEpochMilli(),
-                    0);
+                UUID.randomUUID().toString(),
+                clientId,
+                type,
+                pos,
+                value,
+                Instant.now().toEpochMilli(),
+                0,
+                -1L,
+                -1L,
+                -1,
+                -1);
             localView = OTEngine.apply(localView, op);
             localPending.add(op);
             System.out.println("Staged locally: type=" + op.getType() + ", pos=" + op.getPosition()
@@ -736,8 +766,8 @@ public final class App {
                 return;
             }
 
-            // Attach the current ack count so the chaincode can trim the sender's buffer.
-            Operation candidateForSubmit = withAck(candidate, localAck, !cursorAttachedToLedger);
+            //long seq = queryClientSeqFromWorldState();
+            Operation candidateForSubmit = withAckAndSeq(candidate, localAck, LocalSeq, !cursorAttachedToLedger);
 
             try {
                 contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
@@ -746,6 +776,7 @@ public final class App {
                 // Reset ack after a successful submission.
                 localAck = 0;
                 cursorAttachedToLedger = true;
+                LocalSeq += 1;
                 return;
             } catch (Exception e) {
                 if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
@@ -845,13 +876,17 @@ public final class App {
         }
 
         return new Operation(
-                UUID.randomUUID().toString(),
-                clientId,
-                randomType,
-                randomPos,
-                randomValue,
-                Instant.now().toEpochMilli(),
-                0);
+            UUID.randomUUID().toString(),
+            clientId,
+            randomType,
+            randomPos,
+            randomValue,
+            Instant.now().toEpochMilli(),
+            0,
+            -1L,
+            -1L,
+            -1,
+            -1);
     }
 
     /**
@@ -895,13 +930,17 @@ public final class App {
         }
 
         Operation op = new Operation(
-                UUID.randomUUID().toString(),
-                clientId,
-                finalType,
-                finalPos,
-                finalValue,
-                Instant.now().toEpochMilli(),
-                0);
+            UUID.randomUUID().toString(),
+            clientId,
+            finalType,
+            finalPos,
+            finalValue,
+            Instant.now().toEpochMilli(),
+            0,
+            -1L,
+            -1L,
+            -1,
+            -1);
 
         try {
             localView = OTEngine.apply(localView, op);
@@ -1027,15 +1066,16 @@ public final class App {
             return;
         }
 
-        Operation transformed = serverRec(record.getOperation(), blockNumber, txIndex, actionIndex);
-        List<Operation> transformedBlockOps = new ArrayList<>();
-        transformedBlockOps.add(transformed);
+        List<Operation> orderedOps = collectOrderedOps(record.getOperation(), blockNumber, txIndex, actionIndex);
+        if (orderedOps.isEmpty()) {
+            return;
+        }
 
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
-        clientRec(transformedBlockOps);
+        clientRec(orderedOps);
         tryCreateSnapshot();
         System.out.println("Synced from block=" + blockNumber
-                + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
+            + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
     }
 
 
@@ -1058,14 +1098,12 @@ public final class App {
      *
      * @return the fully-transformed version of {@code incomingRaw}
      */
-    private Operation serverRec(final Operation incomingRaw, final long blockNumber, final int txIndex,
+    private Operation serverRecOne(final Operation incomingRaw, final long blockNumber, final int txIndex,
             final int actionIndex) {
         String senderId = incomingRaw.getClientId();
         if (senderId == null || senderId.isEmpty()) {
             senderId = "unknown";
         }
-
-        knownClients.add(senderId);
 
         // Trim the sender's buffer: the ack value tells us how many remote ops
         // the sender had already seen when it produced this operation.
@@ -1093,7 +1131,7 @@ public final class App {
         lastSyncedVersion++;
 
         // Broadcast the transformed op to every other client's buffer.
-        List<String> recipients = new ArrayList<>(knownClients);
+        List<String> recipients = new ArrayList<>(knownClients.keySet());
         for (String receiverId : recipients) {
             if (receiverId == null || receiverId.equals(senderId)) {
                 continue;
@@ -1140,7 +1178,7 @@ public final class App {
         snapshot.committedView = committedView;
 
         snapshot.clientBuffers = new HashMap<>(clientBuffers);
-        snapshot.knownClients = new HashSet<>(knownClients);
+        snapshot.knownClients = new HashMap<>(knownClients);
 
         String snapshotJson = gson.toJson(snapshot);
         List<String> chunks = splitIntoChunks(snapshotJson, SNAPSHOT_CHUNK_SIZE);
@@ -1310,8 +1348,9 @@ public final class App {
         return initial;
     }
 
-    /** Returns a copy of {@code op} with the given {@code ack} value attached. */
-    private Operation withAck(final Operation op, final long ack, final boolean includeCursor) {
+    /** Returns a copy of {@code op} with the given {@code ack} and {@code clientSeq} attached. */
+    private Operation withAckAndSeq(final Operation op, final long ack, final long clientSeq,
+            final boolean includeCursor) {
         if (includeCursor) {
             return new Operation(
                     op.getOpId(),
@@ -1320,7 +1359,8 @@ public final class App {
                     op.getPosition(),
                     op.getValue(),
                     op.getTimestamp(),
-                    0,
+                    ack,
+                    clientSeq,
                     lastEventBlock,
                     lastEventTxIndex,
                     lastEventActionIndex);
@@ -1332,7 +1372,11 @@ public final class App {
                     op.getPosition(),
                     op.getValue(),
                     op.getTimestamp(),
-                    ack);
+                    ack,
+                    clientSeq,
+                    -1L,
+                    -1,
+                    -1);
         }
     }
 
@@ -1386,6 +1430,93 @@ public final class App {
         return a != null && b != null
                 && a.getClientId() != null
                 && a.getClientId().equals(b.getClientId());
+    }
+
+    private List<PendingOp> extractExpiredPendingOps() {
+        long cutoff = System.currentTimeMillis() - PENDING_OP_TTL_MS;
+        List<PendingOp> expired = new ArrayList<>();
+        pendingByClient.entrySet().removeIf(entry -> {
+            Map<Long, PendingOp> pending = entry.getValue();
+            if (!pending.isEmpty()) {
+                List<Long> keys = new ArrayList<>(pending.keySet());
+                keys.sort(Long::compareTo);
+                for (Long key : keys) {
+                    PendingOp op = pending.get(key);
+                    if (op != null && op.enqueueTimeMs < cutoff) {
+                        expired.add(op);
+                        pending.remove(key);
+                    }
+                }
+            }
+            return pending.isEmpty();
+        });
+        return expired;
+    }
+
+
+
+    private List<Operation> collectOrderedOps(final Operation incoming, final long blockNumber,
+            final int txIndex, final int actionIndex) {
+        List<Operation> ordered = new ArrayList<>();
+        if (incoming == null) {
+            return ordered;
+        }
+
+        List<PendingOp> expired = extractExpiredPendingOps();
+        for (PendingOp op : expired) {
+            ordered.add(serverRecOne(op.op, op.blockNumber, op.txIndex, op.actionIndex));
+        }
+
+        String senderId = incoming.getClientId();
+        if (senderId == null || senderId.isEmpty()) {
+            senderId = "unknown";
+        }
+
+        long seq = incoming.getClientSeq();
+        if (seq < 0) {
+            ordered.add(serverRecOne(incoming, blockNumber, txIndex, actionIndex));
+            return ordered;
+        }
+
+        long expected = knownClients.getOrDefault(senderId, 0L);
+        if (seq > expected) {
+            pendingByClient
+                    .computeIfAbsent(senderId, id -> new HashMap<>())
+                    .putIfAbsent(seq, new PendingOp(incoming, blockNumber, txIndex, actionIndex));
+            return ordered;
+        }
+
+        if (seq < expected) {
+            return ordered;
+        }
+
+        Map<Long, PendingOp> pending = pendingByClient.computeIfAbsent(senderId, id -> new HashMap<>());
+        PendingOp current = new PendingOp(incoming, blockNumber, txIndex, actionIndex);
+        long next = expected;
+        while (current != null) {
+            knownClients.put(senderId, next + 1);
+            ordered.add(serverRecOne(current.op, current.blockNumber, current.txIndex, current.actionIndex));
+            next++;
+            current = pending.remove(next);
+        }
+        return ordered;
+    }
+
+
+    private long queryClientSeqFromWorldState() throws Exception {
+        byte[] result = contract.evaluateTransaction("GetClientSeq", docId, clientId);
+        if (result == null || result.length == 0) {
+            return 0L;
+        }
+        String text = new String(result, StandardCharsets.UTF_8).trim();
+        if (text.isEmpty()) {
+            return 0L;
+        }
+        try {
+            return Long.parseLong(text);
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
     }
 
     private List<String> splitIntoChunks(final String payload, final int chunkSize) {
