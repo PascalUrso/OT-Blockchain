@@ -761,8 +761,14 @@ public final class App {
                 return;
             }
 
-            //long seq = queryClientSeqFromWorldState();
-            Operation candidateForSubmit = withAckAndSeq(candidate, localAck, localSeq, !cursorAttachedToLedger);
+            long seq;
+            try {
+                seq = queryClientSeqFromWorldState();
+            } catch (Exception e) {
+                System.out.println("Failed to read client seq: " + e.getMessage());
+                return;
+            }
+            Operation candidateForSubmit = withAckAndSeq(candidate, localAck, seq, !cursorAttachedToLedger);
 
             try {
                 contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
@@ -771,7 +777,7 @@ public final class App {
                 // Reset ack after a successful submission.
                 localAck = 0;
                 cursorAttachedToLedger = true;
-                localSeq += 1;
+                localSeq = seq + 1;
                 return;
             } catch (Exception e) {
                 if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {

@@ -44,16 +44,6 @@ public final class Operation {
     @Property()
     private final int lastEventActionIndex;
 
-    public Operation(
-            @JsonProperty("opId") final String opId,
-            @JsonProperty("clientId") final String clientId,
-            @JsonProperty("type") final OperationType type,
-            @JsonProperty("position") final int position,
-            @JsonProperty("value") final String value,
-            @JsonProperty("timestamp") final long timestamp,
-            @JsonProperty("ack") final long ack) {
-        this(opId, clientId, type, position, value, timestamp, ack, -1, -1L, -1, -1);
-    }
 
     public Operation(
             @JsonProperty("opId") final String opId,
