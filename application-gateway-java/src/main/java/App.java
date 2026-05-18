@@ -258,12 +258,10 @@ public final class App {
 
     private static final class PendingOp {
         private final Operation op;
-        private final long blockNumber;
         private final long enqueueTimeMs;
 
-        private PendingOp(final Operation op, final long blockNumber) {
+        private PendingOp(final Operation op) {
             this.op = op;
-            this.blockNumber = blockNumber;
             this.enqueueTimeMs = System.currentTimeMillis();
         }
     }
@@ -529,6 +527,24 @@ public final class App {
                 clientBuffers.putAll(snapshot.clientBuffers);
             }
             clientBuffers.putIfAbsent(clientId, new ArrayList<>());
+
+            pendingByClient.clear();
+            if (snapshot.pendingByClient != null) {
+                for (Map.Entry<String, Map<Long, Operation>> entry : snapshot.pendingByClient.entrySet()) {
+                    if (entry.getValue() == null || entry.getValue().isEmpty()) {
+                        continue;
+                    }
+                    Map<Long, PendingOp> pending = new HashMap<>();
+                    for (Map.Entry<Long, Operation> opEntry : entry.getValue().entrySet()) {
+                        if (opEntry.getValue() != null) {
+                            pending.put(opEntry.getKey(), new PendingOp(opEntry.getValue()));
+                        }
+                    }
+                    if (!pending.isEmpty()) {
+                        pendingByClient.put(entry.getKey(), pending);
+                    }
+                }
+            }
             localView = committedView;
             return true;
         } catch (Exception e) {
@@ -1067,7 +1083,7 @@ public final class App {
             return;
         }
 
-        List<Operation> orderedOps = collectOrderedOps(record.getOperation(), blockNumber, txIndex, actionIndex);
+        List<Operation> orderedOps = collectOrderedOps(record.getOperation(), txIndex, actionIndex);
         if (orderedOps.isEmpty()) {
             return;
         }
@@ -1099,7 +1115,7 @@ public final class App {
      *
      * @return the fully-transformed version of {@code incomingRaw}
      */
-    private Operation serverRecOne(final Operation incomingRaw, final long blockNumber) {
+    private Operation serverRecOne(final Operation incomingRaw) {
         String senderId = incomingRaw.getClientId();
         if (senderId == null || senderId.isEmpty()) {
             senderId = "unknown";
@@ -1178,6 +1194,22 @@ public final class App {
         snapshot.committedView = committedView;
 
         snapshot.clientBuffers = new HashMap<>(clientBuffers);
+        snapshot.pendingByClient = new HashMap<>();
+        for (Map.Entry<String, Map<Long, PendingOp>> entry : pendingByClient.entrySet()) {
+            if (entry.getValue() == null || entry.getValue().isEmpty()) {
+                continue;
+            }
+            Map<Long, Operation> ops = new HashMap<>();
+            for (Map.Entry<Long, PendingOp> pendingEntry : entry.getValue().entrySet()) {
+                PendingOp pending = pendingEntry.getValue();
+                if (pending != null && pending.op != null) {
+                    ops.put(pendingEntry.getKey(), pending.op);
+                }
+            }
+            if (!ops.isEmpty()) {
+                snapshot.pendingByClient.put(entry.getKey(), ops);
+            }
+        }
         snapshot.knownClients = new HashMap<>(knownClients);
 
         String snapshotJson = gson.toJson(snapshot);
@@ -1455,8 +1487,7 @@ public final class App {
 
 
 
-    private List<Operation> collectOrderedOps(final Operation incoming, final long blockNumber,
-            final int txIndex, final int actionIndex) {
+    private List<Operation> collectOrderedOps(final Operation incoming, final int txIndex, final int actionIndex) {
         List<Operation> ordered = new ArrayList<>();
         if (incoming == null) {
             return ordered;
@@ -1464,7 +1495,7 @@ public final class App {
 
         List<PendingOp> expired = extractExpiredPendingOps();
         for (PendingOp op : expired) {
-            ordered.add(serverRecOne(op.op, op.blockNumber));
+            ordered.add(serverRecOne(op.op));
         }
 
         String senderId = incoming.getClientId();
@@ -1474,7 +1505,7 @@ public final class App {
 
         long seq = incoming.getClientSeq();
         if (seq < 0) {
-            ordered.add(serverRecOne(incoming, blockNumber));
+            ordered.add(serverRecOne(incoming));
             return ordered;
         }
 
@@ -1482,7 +1513,7 @@ public final class App {
         if (seq > expected) {
                 pendingByClient
                     .computeIfAbsent(senderId, id -> new HashMap<>())
-                    .putIfAbsent(seq, new PendingOp(incoming, blockNumber));
+                    .putIfAbsent(seq, new PendingOp(incoming));
             return ordered;
         }
 
@@ -1491,11 +1522,11 @@ public final class App {
         }
 
         Map<Long, PendingOp> pending = pendingByClient.computeIfAbsent(senderId, id -> new HashMap<>());
-        PendingOp current = new PendingOp(incoming, blockNumber);
+        PendingOp current = new PendingOp(incoming);
         long next = expected;
         while (current != null) {
             knownClients.put(senderId, next + 1);
-            ordered.add(serverRecOne(current.op, current.blockNumber));
+            ordered.add(serverRecOne(current.op));
             next++;
             current = pending.remove(next);
         }

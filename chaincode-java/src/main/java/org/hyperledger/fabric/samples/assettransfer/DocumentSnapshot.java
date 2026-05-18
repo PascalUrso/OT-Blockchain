@@ -43,6 +43,9 @@ public final class DocumentSnapshot {
     private final Map<String, List<Operation>> clientBuffers;
 
     @Property()
+    private final Map<String, Map<Long, Operation>> pendingByClient;
+
+    @Property()
     private final Map<String, Long> knownClients;
 
     public DocumentSnapshot(
@@ -55,6 +58,7 @@ public final class DocumentSnapshot {
             @JsonProperty("lastEventActionIndex") final int lastEventActionIndex,
             @JsonProperty("committedView") final String committedView,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
+            @JsonProperty("pendingByClient") final Map<String, Map<Long, Operation>> pendingByClient,
             @JsonProperty("knownClients") final Map<String, Long> knownClients) {
         this.snapshotId = snapshotId;
         this.docId = docId;
@@ -65,6 +69,7 @@ public final class DocumentSnapshot {
         this.lastEventActionIndex = lastEventActionIndex;
         this.committedView = committedView;
         this.clientBuffers = clientBuffers;
+        this.pendingByClient = pendingByClient;
         this.knownClients = knownClients;
     }
 
@@ -104,6 +109,10 @@ public final class DocumentSnapshot {
 
     public Map<String, List<Operation>> getClientBuffers() {
         return clientBuffers;
+    }
+
+    public Map<String, Map<Long, Operation>> getPendingByClient() {
+        return pendingByClient;
     }
 
     public Map<String, Long> getKnownClients() {

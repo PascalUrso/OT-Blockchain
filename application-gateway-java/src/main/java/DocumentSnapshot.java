@@ -12,5 +12,6 @@ public final class DocumentSnapshot {
     public int lastEventActionIndex;
     public String committedView;
     public Map<String, List<Operation>> clientBuffers;
+    public Map<String, Map<Long, Operation>> pendingByClient;
     public Map<String, Long> knownClients;
 }
