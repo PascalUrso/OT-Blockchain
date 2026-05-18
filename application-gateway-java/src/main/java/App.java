@@ -233,6 +233,9 @@ public final class App {
     /** Buffer for out-of-order ops by client sequence. */
     private final Map<String, Map<Long, PendingOp>> pendingByClient = new HashMap<>();
 
+    /** Guards shared state accessed by the block listener and the main thread. */
+    private final Object stateLock = new Object();
+
     // -------------------------------------------------------------------------
     // Inner types
     // -------------------------------------------------------------------------
@@ -735,19 +738,21 @@ public final class App {
 
         try {
             Operation op = new Operation(
-                UUID.randomUUID().toString(),
-                clientId,
-                type,
-                pos,
-                value,
-                Instant.now().toEpochMilli(),
-                0,
-                -1L,
-                -1L,
-                -1,
-                -1);
-            localView = OTEngine.apply(localView, op);
-            localPending.add(op);
+                    UUID.randomUUID().toString(),
+                    clientId,
+                    type,
+                    pos,
+                    value,
+                    Instant.now().toEpochMilli(),
+                    0,
+                    -1L,
+                    -1L,
+                    -1,
+                    -1);
+            synchronized (stateLock) {
+                localView = OTEngine.apply(localView, op);
+                localPending.add(op);
+            }
             System.out.println("Staged locally: type=" + op.getType() + ", pos=" + op.getPosition()
                     + ", value='" + op.getValue() + "'");
         } catch (Exception e) {
@@ -771,10 +776,17 @@ public final class App {
         }
 
         for (int attempt = 1; attempt <= MAX_SUBMIT_RETRIES; attempt++) {
-            Operation candidate = getNextUnsubmittedPending();
-            if (candidate == null) {
-                System.out.println("No unsubmitted local pending operations");
-                return;
+            Operation candidate;
+            long ackSnapshot;
+            boolean includeCursor;
+            synchronized (stateLock) {
+                candidate = getNextUnsubmittedPending();
+                if (candidate == null) {
+                    System.out.println("No unsubmitted local pending operations");
+                    return;
+                }
+                ackSnapshot = localAck;
+                includeCursor = !cursorAttachedToLedger;
             }
 
             long seq;
@@ -784,16 +796,18 @@ public final class App {
                 System.out.println("Failed to read client seq: " + e.getMessage());
                 return;
             }
-            Operation candidateForSubmit = withAckAndSeq(candidate, localAck, seq, !cursorAttachedToLedger);
+            Operation candidateForSubmit = withAckAndSeq(candidate, ackSnapshot, seq, includeCursor);
 
             try {
                 contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
-                submittedPendingOpIds.add(candidateForSubmit.getOpId());
-                System.out.println("Tx successfully sent, op_id=" + candidateForSubmit.getOpId() + ", ack=" + localAck);
-                // Reset ack after a successful submission.
-                localAck = 0;
-                cursorAttachedToLedger = true;
-                localSeq = seq + 1;
+                synchronized (stateLock) {
+                    submittedPendingOpIds.add(candidateForSubmit.getOpId());
+                    // Reset ack after a successful submission.
+                    localAck = 0;
+                    cursorAttachedToLedger = true;
+                    localSeq = seq + 1;
+                }
+                System.out.println("Tx successfully sent, op_id=" + candidateForSubmit.getOpId() + ", ack=" + ackSnapshot);
                 return;
             } catch (Exception e) {
                 if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
@@ -1075,24 +1089,26 @@ public final class App {
 
     private void applyCommittedRecordFromEvent(final OperationRecord record, final long blockNumber,
             final int txIndex, final int actionIndex) {
-        lastEventBlock = blockNumber;
-        lastEventTxIndex = txIndex;
-        lastEventActionIndex = actionIndex;
+        synchronized (stateLock) {
+            lastEventBlock = blockNumber;
+            lastEventTxIndex = txIndex;
+            lastEventActionIndex = actionIndex;
 
-        if (record == null || record.getOperation() == null) {
-            return;
+            if (record == null || record.getOperation() == null) {
+                return;
+            }
+
+            List<Operation> orderedOps = collectOrderedOps(record.getOperation(), txIndex, actionIndex);
+            if (orderedOps.isEmpty()) {
+                return;
+            }
+
+            chainState = new DocumentState(docId, committedView, lastSyncedVersion);
+            clientRec(orderedOps);
+            tryCreateSnapshot();
+            System.out.println("Synced from block=" + blockNumber
+                + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
         }
-
-        List<Operation> orderedOps = collectOrderedOps(record.getOperation(), txIndex, actionIndex);
-        if (orderedOps.isEmpty()) {
-            return;
-        }
-
-        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
-        clientRec(orderedOps);
-        tryCreateSnapshot();
-        System.out.println("Synced from block=" + blockNumber
-            + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
     }
 
 
