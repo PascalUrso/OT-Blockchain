@@ -27,7 +27,10 @@ import org.hyperledger.fabric.protos.peer.Transaction;
 import org.hyperledger.fabric.protos.peer.TransactionAction;
 import org.hyperledger.fabric.protos.peer.TxValidationCode;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.io.IOException;
+import java.io.BufferedWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -94,7 +97,8 @@ public final class App {
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final Scanner scanner = new Scanner(System.in);
-    private final Random random = new Random();
+    private final Random random;
+    private final Object stateLock = new Object();
 
     private final Network network;
     private final Contract contract;
@@ -102,6 +106,9 @@ public final class App {
 
     /** True when running in automated test mode (no user interaction). */
     private final boolean testMode;
+
+    /** True when running realtime experiment mode. */
+    private final boolean realtimeMode;
 
     // -------------------------------------------------------------------------
     // Session state
@@ -162,7 +169,8 @@ public final class App {
 
     // to record the ops and time since last snapshot for creating snapshots
     private long lastSnapshotVersion = 0;
-    private long lastSnapshotTimeMs = 0;
+    private long lastSnapshotTimeMs = System.currentTimeMillis();
+    private long nextSnapshotIntervalMs = SNAPSHOT_TRIGGER_MS;
 
     // -------------------------------------------------------------------------
     // Test / replay state
@@ -191,6 +199,7 @@ public final class App {
      * transformation.
      * Used to initialise the per-client buffers of late-joining peers.
      */
+    private final List<Operation> committedHistory = new CopyOnWriteArrayList<>();
 
     /**
      * Per-client "outstanding" buffers: for a given sender, the buffer holds the
@@ -232,8 +241,9 @@ public final class App {
     /** Buffer for out-of-order ops by client sequence. */
     private final Map<String, Map<Long, PendingOp>> pendingByClient = new HashMap<>();
 
-    /** Guards shared state accessed by the block listener and the main thread. */
-    private final Object stateLock = new Object();
+    /** Optional metrics sink for test runs. */
+    private final MetricsRecorder metrics;
+
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -268,6 +278,84 @@ public final class App {
         }
     }
 
+    /** Simple CSV metrics recorder used in test mode. */
+    private static final class MetricsRecorder {
+        private final BufferedWriter writer;
+        private final ThreadMXBean threadBean;
+        private final boolean enabled;
+
+        private MetricsRecorder() {
+            this.writer = null;
+            this.threadBean = null;
+            this.enabled = false;
+        }
+
+        private MetricsRecorder(final BufferedWriter writer, final ThreadMXBean threadBean) {
+            this.writer = writer;
+            this.threadBean = threadBean;
+            this.enabled = true;
+        }
+
+        static MetricsRecorder fromConfig(final TestRunConfig cfg) {
+            if (cfg == null || !cfg.metricsEnabled || cfg.metricsOutputPath == null || cfg.metricsOutputPath.isBlank()) {
+                return new MetricsRecorder();
+            }
+            try {
+                Path p = Path.of(cfg.metricsOutputPath).toAbsolutePath().normalize();
+                if (p.getParent() != null) {
+                    Files.createDirectories(p.getParent());
+                }
+                boolean newFile = !Files.exists(p);
+                BufferedWriter w = Files.newBufferedWriter(p, StandardCharsets.UTF_8,
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                if (newFile) {
+                    w.write("timestamp,event,type,details,wall_ns,cpu_ns\n");
+                    w.flush();
+                }
+                return new MetricsRecorder(w, ManagementFactory.getThreadMXBean());
+            } catch (Exception e) {
+                System.out.println("Metrics init failed: " + e.getMessage());
+                return new MetricsRecorder();
+            }
+        }
+
+        long[] start() {
+            if (!enabled) {
+                return new long[] { 0L, 0L };
+            }
+            long wall = System.nanoTime();
+            long cpu = threadBean != null && threadBean.isCurrentThreadCpuTimeSupported() ? threadBean.getCurrentThreadCpuTime() : 0L;
+            return new long[] { wall, cpu };
+        }
+
+        void end(final String event, final String type, final String details, final long[] start) {
+            if (!enabled) {
+                return;
+            }
+            try {
+                long wall = System.nanoTime() - start[0];
+                long cpu = threadBean != null && threadBean.isCurrentThreadCpuTimeSupported() ?
+                        threadBean.getCurrentThreadCpuTime() - start[1] : 0L;
+                String line = System.currentTimeMillis() + "," + event + "," + type + "," + details + "," + wall + "," + cpu + "\n";
+                writer.write(line);
+                writer.flush();
+            } catch (Exception e) {
+                System.out.println("Metrics write failed: " + e.getMessage());
+            }
+        }
+
+        void flush() {
+            if (!enabled) {
+                return;
+            }
+            try {
+                writer.flush();
+                writer.close();
+            } catch (Exception ignore) {
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Entry point
     // -------------------------------------------------------------------------
@@ -298,8 +386,19 @@ public final class App {
     public App(final Gateway gateway, final TestRunConfig runConfig) {
         this.runConfig = runConfig;
         this.testMode = runConfig != null && runConfig.isTestMode();
+        this.realtimeMode = runConfig != null && runConfig.isRealtimeMode();
+        this.random = createRandom(runConfig);
         this.network = gateway.getNetwork(runConfig.channelName);
         this.contract = network.getContract(runConfig.chaincodeName);
+        this.metrics = MetricsRecorder.fromConfig(runConfig);
+        this.nextSnapshotIntervalMs = sampleSnapshotIntervalMs();
+    }
+
+    private Random createRandom(final TestRunConfig cfg) {
+        if (cfg != null && cfg.opTimingSeed != 0L) {
+            return new Random(cfg.opTimingSeed);
+        }
+        return new Random();
     }
 
     // -------------------------------------------------------------------------
@@ -307,19 +406,24 @@ public final class App {
     // -------------------------------------------------------------------------
 
     private void run() throws Exception {
-        if (testMode) {
+        if (testMode || realtimeMode) {
             // In test mode all parameters come from the config file.
             clientId = normalize(runConfig.clientId, "userA");
             docId = normalize(runConfig.docId, "doc_1");
-            testClocks.clear();
-            scheduledOps.clear();
-            nextScheduledOpIndex = 0;
-            if (runConfig.clocks != null) {
-                testClocks.addAll(runConfig.clocks);
+            if (testMode) {
+                testClocks.clear();
+                scheduledOps.clear();
+                nextScheduledOpIndex = 0;
+                if (runConfig.clocks != null) {
+                    testClocks.addAll(runConfig.clocks);
+                }
+                loadScheduledOps();
+                System.out
+                        .println("Running in test mode, client=" + clientId + ", doc=" + docId + ", clocks=" + testClocks);
+            } else {
+                System.out.println("Running in realtime mode, client=" + clientId + ", doc=" + docId
+                        + ", durationMs=" + effectiveRealtimeDurationMs());
             }
-            loadScheduledOps();
-            System.out
-                    .println("Running in test mode, client=" + clientId + ", doc=" + docId + ", clocks=" + testClocks);
         } else {
             System.out.print("Enter client_id (default userA): ");
             if (!scanner.hasNextLine()) {
@@ -334,16 +438,29 @@ public final class App {
             docId = normalize(scanner.nextLine(), "doc_1");
         }
 
-        bootstrap();
-        if (!eventListenerStarted) {
-            startBlockListener();
+
+        applyStartupDelay();
+        long[] _m_start = metrics.start();
+        try {
+            bootstrap();
+            if (!eventListenerStarted) {
+                startBlockListener();
+                
+            }
+        } finally {
+            metrics.end("startup", "bootstrap", clientId == null ? "" : clientId, _m_start);
         }
 
         if (testMode) {
             runTestMode();
             return;
-        }
+        }        
 
+        if (realtimeMode) {
+            runRealtimeMode();
+            return;
+        }
+        
         // Interactive REPL
         while (true) {
             printStatus();
@@ -376,8 +493,7 @@ public final class App {
                     manualEventSync();
                     try {
                         saveSnapshotToChain();
-                        lastSnapshotVersion = lastSyncedVersion;
-                        lastSnapshotTimeMs = System.currentTimeMillis();
+                        resetSnapshotTimer(System.currentTimeMillis());
                     } catch (Exception e) {
                         System.out.println("Snapshot save failed: " + e.getMessage());
                     }
@@ -410,9 +526,10 @@ public final class App {
 
         int totalOps = runConfig.totalOps;
         long deadline = System.currentTimeMillis() + timeoutSeconds * 1000;
-
+        long N = totalOps+lastSyncedVersion;
+        submitScheduledOpsAtClock(localClock);
         // Wait until the ledger has committed all expected operations (or timeout).
-        while (lastSyncedVersion < totalOps) {
+        while (lastSyncedVersion < N) {
             if (System.currentTimeMillis() > deadline) {
                 System.out.println(
                         "Test mode timed out waiting for " + totalOps + " ops (got " + lastSyncedVersion + ")");
@@ -421,8 +538,46 @@ public final class App {
             TimeUnit.MILLISECONDS.sleep(pollMillis);
         }
 
-        manualEventSync();
+        printStatus();
         System.out.println("Test mode finished. dispatched=" + nextScheduledOpIndex + "/" + scheduledOps.size());
+    }
+
+    /**
+     * Realtime experiment mode: submit random operations continuously for a
+     * fixed wall-clock duration, using the configured submission timing mode.
+     */
+    private void runRealtimeMode() throws Exception {
+        long durationMs = effectiveRealtimeDurationMs();
+        long pollMillis = runConfig.realtimePollMillis <= 0 ? 100 : runConfig.realtimePollMillis;
+        long deadline = System.currentTimeMillis() + durationMs - runConfig.startupDelayMs;
+        long nextSubmitAt = System.currentTimeMillis();
+        int submitted = 0;
+
+        System.out.println("Realtime mode started, duration=" + durationMs + "ms, opMode="
+                + normalize(runConfig.opTimingMode, "poisson") + ", poll=" + pollMillis + "ms");
+        
+        while (System.currentTimeMillis() < deadline) {
+            
+            long now = System.currentTimeMillis();
+            if (now >= nextSubmitAt) {
+                Operation op = getRandomOp();
+                stagePendingAndSubmit(localClock, op.getType(), null, null);
+                submitted++;
+                nextSubmitAt = now + sampleRealtimeOpIntervalMs();
+                continue;
+            }
+            long sleepMs = Math.min(pollMillis, Math.max(1L, nextSubmitAt - now));
+            TimeUnit.MILLISECONDS.sleep(sleepMs);
+        }
+
+        long settleDeadline = System.currentTimeMillis() + Math.max(0L, runConfig.realtimeDrainTimeoutMs);
+        while (hasUnsubmittedPending() && System.currentTimeMillis() < settleDeadline) {
+            TimeUnit.MILLISECONDS.sleep(pollMillis);
+        }
+
+        printStatus();
+        System.out.println("Realtime mode finished. submitted=" + submitted + ", pending=" + localPending.size()
+                + ", unsubmitted=" + hasUnsubmittedPending());
     }
 
     /**
@@ -459,6 +614,48 @@ public final class App {
         scheduledOps.sort((a, b) -> Integer.compare(a.clock, b.clock));
     }
 
+    private void applyStartupDelay() throws InterruptedException {
+        long delayMs = runConfig == null ? 0L : Math.max(0L, runConfig.startupDelayMs);
+        if (delayMs > 0) {
+            System.out.println("Startup delayed by " + delayMs + "ms");
+            TimeUnit.MILLISECONDS.sleep(delayMs);
+        }
+    }
+
+    private long effectiveRealtimeDurationMs() {
+        return runConfig != null && runConfig.experimentDurationMs > 0 ? runConfig.experimentDurationMs : 300_000L;
+    }
+
+    private long sampleRealtimeOpIntervalMs() {
+        String mode = normalize(runConfig.opTimingMode, "poisson").toLowerCase();
+        long meanMs = runConfig.opTimingMeanMs > 0 ? runConfig.opTimingMeanMs : 1_000L;
+        long windowMs = Math.max(0L, runConfig.opTimingWindowMs);
+        int burstSize = runConfig.opBurstSize > 0 ? runConfig.opBurstSize : 1;
+        long burstGapMs = Math.max(0L, runConfig.opBurstGapMs);
+        long burstJitterMs = Math.max(0L, runConfig.opBurstJitterMs);
+        long min = Math.max(1L, Math.round(meanMs * 0.9d));
+        long max = Math.max(min, Math.round(meanMs * 1.1d));
+
+        long sampled;
+        switch (mode) {
+            case "simultaneous":
+                sampled = 0L;
+                break;
+            case "uniform":
+                sampled = random.nextInt((int) Math.min(Integer.MAX_VALUE, Math.max(1L, windowMs)) + 1);
+                break;
+            case "burst":
+                sampled = burstGapMs + (burstJitterMs > 0 ? random.nextInt((int) Math.min(Integer.MAX_VALUE, burstJitterMs) + 1) : 0);
+                break;
+            case "poisson":
+            default:
+                sampled = Math.round(random.nextGaussian() * (meanMs * 0.1d) + meanMs);
+                break;
+        }
+
+        return Math.max(min, Math.min(max, sampled));
+    }
+
     // -------------------------------------------------------------------------
     // Initialisation
     // -------------------------------------------------------------------------
@@ -480,7 +677,7 @@ public final class App {
         cursorAttachedToLedger = false;
         localPending.clear();
         submittedPendingOpIds.clear();
-        submitScheduledOpsAtClock(localClock);
+        
 
         if (!loadSnapshotFromChain()) {
             committedView = "";
@@ -494,7 +691,9 @@ public final class App {
             clientBuffers.put(clientId, new ArrayList<>());
             lastEventBlock = 0;
             rebuildCommittedFromLedger();
+            resetSnapshotTimer(System.currentTimeMillis());
         }
+        
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
     }
@@ -504,6 +703,7 @@ public final class App {
      * Called once on startup.
      */
     private boolean loadSnapshotFromChain() {
+        long[] _m_start = metrics.start();
         try {
             DocumentSnapshot snapshot = queryLatestSnapshot();
             if (snapshot == null || snapshot.committedView == null) {
@@ -513,9 +713,11 @@ public final class App {
             committedView = snapshot.committedView;
             localView = committedView;
             lastSyncedVersion = snapshot.version;
+            localAck = snapshot.version;
             chainState = new DocumentState(docId, committedView, lastSyncedVersion);
             lastSnapshotVersion = snapshot.version;
             lastSnapshotTimeMs = System.currentTimeMillis();
+            nextSnapshotIntervalMs = sampleSnapshotIntervalMs();
             lastEventBlock = snapshot.lastBlockNumber;
             lastEventTxIndex = snapshot.lastEventTxIndex;
             lastEventActionIndex = snapshot.lastEventActionIndex;
@@ -548,11 +750,17 @@ public final class App {
                         pendingByClient.put(entry.getKey(), pending);
                     }
                 }
+                committedHistory.clear();
+                if (snapshot.committedHistory != null) {
+                    committedHistory.addAll(snapshot.committedHistory);
+                }
             }
             localView = committedView;
+            metrics.end("snapshot", "load", "version=" + snapshot.version, _m_start);
             return true;
         } catch (Exception e) {
             System.out.println("Snapshot load failed: " + e.getMessage());
+            metrics.end("snapshot", "load", "error", _m_start);
             return false;
         }
     }
@@ -705,6 +913,7 @@ public final class App {
                         continue;
                     }
                     applyCommittedRecordFromEvent(record, blockNumber, txIndex, actionIndex);
+                    tryCreateSnapshot();
                 }
             } catch (Exception e) {
                 System.out.println("Block parse failed: " + e.getMessage());
@@ -751,7 +960,7 @@ public final class App {
                     -1L,
                     -1,
                     -1);
-            synchronized (this) {
+            synchronized (stateLock) {
                 localView = OTEngine.apply(localView, op);
                 localPending.add(op);
             }
@@ -791,7 +1000,7 @@ public final class App {
                 return;
             }
 
-            synchronized (this) {
+            synchronized (stateLock) {
                 candidate = getNextUnsubmittedPending();
                 if (candidate == null) {
                     System.out.println("No unsubmitted local pending operations");
@@ -803,7 +1012,9 @@ public final class App {
                 Operation candidateForSubmit = withAckAndSeq(candidate, ackSnapshot, seq, includeCursor);
 
                 try {
+                    long[] _m_start = metrics.start();
                     contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
+                    metrics.end("op", "submit", candidateForSubmit.getOpId(), _m_start);
                     submittedPendingOpIds.add(candidateForSubmit.getOpId());
                     // Reset ack after a successful submission.
                     localAck = 0;
@@ -822,7 +1033,11 @@ public final class App {
                 }
             }
         }
-        System.out.println("Submit failed: " + lastError.getMessage());
+        if (lastError != null) {
+            System.out.println("Submit failed: " + lastError.getMessage());
+        } else {
+            System.out.println("Submit succeded.");
+        }
         return;
     }
 
@@ -933,53 +1148,57 @@ public final class App {
             final OperationType type,
             final Integer requestedPosition,
             final String requestedValue) {
-        int len = localView == null ? 0 : localView.length();
-        OperationType finalType = type;
-        int finalPos;
-        String finalValue = requestedValue == null ? "" : requestedValue;
-
-        // Downgrade delete/update to insert when the document is empty.
-        if (finalType == OperationType.delete || finalType == OperationType.update) {
-            if (len <= 0) {
-                finalType = OperationType.insert;
-            }
-        }
-
-        // Clamp position to the valid range for the chosen operation type.
-        if (finalType == OperationType.insert) {
-            int pos = requestedPosition == null ? random.nextInt(len + 1) : requestedPosition;
-            finalPos = Math.max(0, Math.min(pos, len));
-            if (finalValue.isEmpty()) {
-                finalValue = randomLowercaseValue();
-            }
-        } else if (finalType == OperationType.delete) {
-            int pos = requestedPosition == null ? random.nextInt(len) : requestedPosition;
-            finalPos = Math.max(0, Math.min(pos, len - 1));
-            finalValue = "";
-        } else {
-            int pos = requestedPosition == null ? random.nextInt(len) : requestedPosition;
-            finalPos = Math.max(0, Math.min(pos, len - 1));
-            if (finalValue.isEmpty()) {
-                finalValue = randomLowercaseValue();
-            }
-        }
-
-        Operation op = new Operation(
-                UUID.randomUUID().toString(),
-                clientId,
-                finalType,
-                finalPos,
-                finalValue,
-                Instant.now().toEpochMilli(),
-                0,
-                -1L,
-                -1L,
-                -1,
-                -1);
-
         try {
-            localView = OTEngine.apply(localView, op);
-            localPending.add(op);
+            Operation op;
+            synchronized (stateLock) {
+                int len = localView == null ? 0 : localView.length();
+                OperationType finalType = type;
+                int finalPos;
+                String finalValue = requestedValue == null ? "" : requestedValue;
+
+                // Downgrade delete/update to insert when the document is empty.
+                if (finalType == OperationType.delete || finalType == OperationType.update) {
+                    if (len <= 0) {
+                        finalType = OperationType.insert;
+                    }
+                }
+
+                // Clamp position to the valid range for the chosen operation type.
+                if (finalType == OperationType.insert) {
+                    int pos = requestedPosition == null ? random.nextInt(len + 1) : requestedPosition;
+                    finalPos = Math.max(0, Math.min(pos, len));
+                    if (finalValue.isEmpty()) {
+                        finalValue = randomLowercaseValue();
+                    }
+                } else if (finalType == OperationType.delete) {
+                    int pos = requestedPosition == null ? random.nextInt(len) : requestedPosition;
+                    finalPos = Math.max(0, Math.min(pos, len - 1));
+                    finalValue = "";
+                } else {
+                    int pos = requestedPosition == null ? random.nextInt(len) : requestedPosition;
+                    finalPos = Math.max(0, Math.min(pos, len - 1));
+                    if (finalValue.isEmpty()) {
+                        finalValue = randomLowercaseValue();
+                    }
+                }
+
+                op = new Operation(
+                        UUID.randomUUID().toString(),
+                        clientId,
+                        finalType,
+                        finalPos,
+                        finalValue,
+                        Instant.now().toEpochMilli(),
+                        0,
+                        -1L,
+                        -1L,
+                        -1,
+                        -1);
+
+                localView = OTEngine.apply(localView, op);
+                localPending.add(op);
+            }
+
             submitNextPending();
             System.out.println("Submitted op at clock=" + clock + ", opId=" + op.getOpId()
                     + ", type=" + op.getType() + ", pos=" + op.getPosition() + ", value='" + op.getValue() + "'");
@@ -1022,7 +1241,7 @@ public final class App {
 
             if (!localPending.isEmpty() && op.getClientId().equals(clientId)) {
                 // This committed op is our own: the first pending entry is confirmed.
-                synchronized (this) {
+                synchronized (stateLock) {
                     localPending.subList(0, 1).clear();
                     submittedPendingOpIds.remove(op.getOpId());
                 }
@@ -1032,7 +1251,7 @@ public final class App {
 
             // Remote op: transform it against each local pending op (and vice-versa),
             // keeping localPending consistent with the updated committed history.
-            synchronized (this) {
+            synchronized (stateLock) {
                 localAck++;
                 for (int i = 0; i < localPending.size(); i++) {
                     Operation pendingOp = localPending.get(i);
@@ -1096,6 +1315,8 @@ public final class App {
 
     private void applyCommittedRecordFromEvent(final OperationRecord record, final long blockNumber,
             final int txIndex, final int actionIndex) {
+        long[] _m_start = metrics.start();
+        
         lastEventBlock = blockNumber;
         lastEventTxIndex = txIndex;
         lastEventActionIndex = actionIndex;
@@ -1111,9 +1332,13 @@ public final class App {
 
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
         clientRec(orderedOps);
-        tryCreateSnapshot();
+        //tryCreateSnapshot();
         System.out.println("Synced from block=" + blockNumber
-                + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
+            + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
+        if(chainState.getVersion() % 10 == 0) {
+            printStatus();
+        }
+        metrics.end("op", "receive", record != null && record.getOperation() != null ? record.getOperation().getOpId() : "", _m_start);
     }
 
     /**
@@ -1148,14 +1373,10 @@ public final class App {
         if (ack > 0) {
             senderBuffer.subList(0, ack).clear();
         }
-
         // Transform incoming against the remaining buffer ops (ops the sender missed).
         Operation incoming = incomingRaw;
         for (int i = 0; i < senderBuffer.size(); i++) {
             Operation bufferOp = senderBuffer.get(i);
-            if (sameClient(bufferOp, incoming)) {
-                continue;
-            }
             Operation bufferPrime = OTEngine.transform(bufferOp, incoming);
             Operation incomingPrime = OTEngine.transform(incoming, bufferOp);
             senderBuffer.set(i, bufferPrime);
@@ -1164,6 +1385,7 @@ public final class App {
 
         committedView = OTEngine.apply(committedView, incoming);
         lastSyncedVersion++;
+        committedHistory.add(incoming);
 
         // Broadcast the transformed op to every other client's buffer.
         List<String> recipients = new ArrayList<>(knownClients.keySet());
@@ -1181,6 +1403,9 @@ public final class App {
     // Save snapshot to chain
     // -------------------------------------------------------------------------
     private void tryCreateSnapshot() {
+        if (runConfig != null && !runConfig.snapshotEnabled) {
+            return;
+        }
         if (!localPending.isEmpty()) {
             return;
         }
@@ -1188,14 +1413,16 @@ public final class App {
         long now = System.currentTimeMillis();
         long opsSinceSnapshot = lastSyncedVersion - lastSnapshotVersion;
         boolean opsTrigger = opsSinceSnapshot >= SNAPSHOT_TRIGGER_OPS;
-        boolean timeTrigger = (now - lastSnapshotTimeMs) >= SNAPSHOT_TRIGGER_MS;
+        boolean timeTrigger = (now - lastSnapshotTimeMs) >= nextSnapshotIntervalMs;
         System.out.println("opsTrigger=" + opsTrigger + ", timeTrigger=" + timeTrigger + ", now=" + now
-                + ", lastSnapshotTimeMs=" + lastSnapshotTimeMs);
+                + ", lastSnapshotTimeMs=" + lastSnapshotTimeMs + ", nextSnapshotIntervalMs="
+                + nextSnapshotIntervalMs);
         if ((opsTrigger || timeTrigger) && lastSyncedVersion > lastSnapshotVersion) {
             try {
                 saveSnapshotToChain();
                 lastSnapshotVersion = lastSyncedVersion;
                 lastSnapshotTimeMs = now;
+                nextSnapshotIntervalMs = sampleSnapshotIntervalMs();
             } catch (Exception e) {
                 System.out.println("Snapshot save failed: " + e.getMessage());
             }
@@ -1203,54 +1430,81 @@ public final class App {
     }
 
     private void saveSnapshotToChain() throws Exception {
-        DocumentSnapshot snapshot = new DocumentSnapshot();
-        snapshot.snapshotId = UUID.randomUUID().toString();
-        snapshot.docId = docId;
-        snapshot.version = lastSyncedVersion;
-        snapshot.timestamp = System.currentTimeMillis();
-        snapshot.lastBlockNumber = lastEventBlock;
-        snapshot.lastEventTxIndex = lastEventTxIndex;
-        snapshot.lastEventActionIndex = lastEventActionIndex;
-        snapshot.committedView = committedView;
+        if (runConfig != null && !runConfig.snapshotEnabled) {
+            System.out.println("Snapshot persistence disabled by config.");
+            return;
+        }
+        long[] _m_start = metrics.start();
+        DocumentSnapshot snapshot = null;
+        try {
+            snapshot = new DocumentSnapshot();
+            snapshot.snapshotId = UUID.randomUUID().toString();
+            snapshot.docId = docId;
+            snapshot.version = lastSyncedVersion;
+            snapshot.timestamp = System.currentTimeMillis();
+            snapshot.lastBlockNumber = lastEventBlock;
+            snapshot.lastEventTxIndex = lastEventTxIndex;
+            snapshot.lastEventActionIndex = lastEventActionIndex;
+            snapshot.committedView = committedView;
 
-        snapshot.clientBuffers = new HashMap<>(clientBuffers);
-        snapshot.pendingByClient = new HashMap<>();
-        for (Map.Entry<String, Map<Long, PendingOp>> entry : pendingByClient.entrySet()) {
-            if (entry.getValue() == null || entry.getValue().isEmpty()) {
-                continue;
-            }
-            Map<Long, Operation> ops = new HashMap<>();
-            for (Map.Entry<Long, PendingOp> pendingEntry : entry.getValue().entrySet()) {
-                PendingOp pending = pendingEntry.getValue();
-                if (pending != null && pending.op != null) {
-                    ops.put(pendingEntry.getKey(), pending.op);
+            snapshot.clientBuffers = new HashMap<>(clientBuffers);
+            snapshot.pendingByClient = new HashMap<>();
+            for (Map.Entry<String, Map<Long, PendingOp>> entry : pendingByClient.entrySet()) {
+                if (entry.getValue() == null || entry.getValue().isEmpty()) {
+                    continue;
+                }
+                Map<Long, Operation> ops = new HashMap<>();
+                for (Map.Entry<Long, PendingOp> pendingEntry : entry.getValue().entrySet()) {
+                    PendingOp pending = pendingEntry.getValue();
+                    if (pending != null && pending.op != null) {
+                        ops.put(pendingEntry.getKey(), pending.op);
+                    }
+                }
+                if (!ops.isEmpty()) {
+                    snapshot.pendingByClient.put(entry.getKey(), ops);
                 }
             }
-            if (!ops.isEmpty()) {
-                snapshot.pendingByClient.put(entry.getKey(), ops);
+            snapshot.knownClients = new HashMap<>(knownClients);
+            snapshot.committedHistory = new ArrayList<>(committedHistory);
+
+            String snapshotJson = gson.toJson(snapshot);
+            List<String> chunks = splitIntoChunks(snapshotJson, SNAPSHOT_CHUNK_SIZE);
+            for (int i = 0; i < chunks.size(); i++) {
+                contract.submitTransaction("SaveSnapshotChunk",
+                        docId,
+                        snapshot.snapshotId,
+                        String.valueOf(i),
+                        String.valueOf(chunks.size()),
+                        chunks.get(i));
             }
-        }
-        snapshot.knownClients = new HashMap<>(knownClients);
 
-        String snapshotJson = gson.toJson(snapshot);
-        List<String> chunks = splitIntoChunks(snapshotJson, SNAPSHOT_CHUNK_SIZE);
-        for (int i = 0; i < chunks.size(); i++) {
-            contract.submitTransaction("SaveSnapshotChunk",
-                    docId,
+            SnapshotPointer pointer = new SnapshotPointer(
+                    snapshot.docId,
                     snapshot.snapshotId,
-                    String.valueOf(i),
-                    String.valueOf(chunks.size()),
-                    chunks.get(i));
+                    snapshot.version,
+                    snapshot.timestamp,
+                    chunks.size());
+            contract.submitTransaction("CommitSnapshotPointer", docId, gson.toJson(pointer));
+            System.out.println("Snapshot saved: version=" + snapshot.version);
+        } finally {
+            String details = snapshot == null ? "unknown" : "version=" + snapshot.version;
+            metrics.end("snapshot", "save", details, _m_start);
         }
+    }
 
-        SnapshotPointer pointer = new SnapshotPointer(
-                snapshot.docId,
-                snapshot.snapshotId,
-                snapshot.version,
-                snapshot.timestamp,
-                chunks.size());
-        contract.submitTransaction("CommitSnapshotPointer", docId, gson.toJson(pointer));
-        System.out.println("Snapshot saved: version=" + snapshot.version);
+    private void resetSnapshotTimer(final long now) {
+        lastSnapshotTimeMs = now;
+        nextSnapshotIntervalMs = sampleSnapshotIntervalMs();
+    }
+
+    private long sampleSnapshotIntervalMs() {
+        long mean = runConfig != null && runConfig.snapshotIntervalMs > 0 ? runConfig.snapshotIntervalMs
+                : SNAPSHOT_TRIGGER_MS;
+        long min = Math.max(1L, Math.round(mean * 0.9d));
+        long max = Math.max(min, Math.round(mean * 1.1d));
+        double sigma = Math.max(1.0d, mean * 0.1d);
+        long sampled = Math.round(mean + random.nextGaussian() * sigma);
+        return Math.max(min, Math.min(max, sampled));
     }
 
     // -------------------------------------------------------------------------
@@ -1281,123 +1535,19 @@ public final class App {
      * after the cursor stored in the first submitted op.
      */
     private List<Operation> buildInitialBufferForClient(final String targetClientId, final Operation referenceOp) {
-        long cursorBlock = referenceOp == null ? -1L : referenceOp.getLastEventBlock();
-        int cursorTxIndex = referenceOp == null ? -1 : referenceOp.getLastEventTxIndex();
-        int cursorActionIndex = referenceOp == null ? -1 : referenceOp.getLastEventActionIndex();
         List<Operation> initial = new ArrayList<>();
-        try {
-            long upperBound = lastEventBlock;
-            if (cursorBlock < 0 || upperBound < cursorBlock) {
-                return initial;
-            }
-
-            try (var events = network
-                    .newBlockEventsRequest()
-                    .startBlock(cursorBlock)
-                    .build()
-                    .getEvents()) {
-                while (events.hasNext()) {
-                    Block block = events.next();
-                    if (block == null) {
-                        continue;
-                    }
-
-                    long blockNumber = block.getHeader().getNumber();
-                    if (blockNumber > upperBound) {
-                        break;
-                    }
-
-                    List<ByteString> txs = block.getData().getDataList();
-                    ByteString txFilter = ByteString.EMPTY;
-                    if (block.hasMetadata()
-                            && block.getMetadata().getMetadataCount() > BlockMetadataIndex.TRANSACTIONS_FILTER_VALUE) {
-                        txFilter = block.getMetadata().getMetadataList()
-                                .get(BlockMetadataIndex.TRANSACTIONS_FILTER_VALUE);
-                    }
-
-                    for (int txIndex = 0; txIndex < txs.size(); txIndex++) {
-                        if (blockNumber == cursorBlock && txIndex < cursorTxIndex) {
-                            continue;
-                        }
-
-                        if (!txFilter.isEmpty() && txIndex < txFilter.size()) {
-                            int validationCode = txFilter.byteAt(txIndex);
-                            if (TxValidationCode.forNumber(validationCode) != TxValidationCode.VALID) {
-                                continue;
-                            }
-                        }
-
-                        try {
-                            Envelope envelope = Envelope.parseFrom(txs.get(txIndex));
-                            Payload payload = Payload.parseFrom(envelope.getPayload());
-                            if (!payload.hasHeader()) {
-                                continue;
-                            }
-
-                            ChannelHeader channelHeader = ChannelHeader
-                                    .parseFrom(payload.getHeader().getChannelHeader());
-                            if (channelHeader.getType() != HeaderType.ENDORSER_TRANSACTION_VALUE) {
-                                continue;
-                            }
-
-                            Transaction tx = Transaction.parseFrom(payload.getData());
-                            List<TransactionAction> actions = tx.getActionsList();
-                            for (int actionIndex = 0; actionIndex < actions.size(); actionIndex++) {
-                                if (blockNumber == cursorBlock
-                                        && txIndex == cursorTxIndex
-                                        && actionIndex <= cursorActionIndex) {
-                                    continue;
-                                }
-
-                                TransactionAction action = actions.get(actionIndex);
-                                ChaincodeActionPayload actionPayload = ChaincodeActionPayload
-                                        .parseFrom(action.getPayload());
-                                if (!actionPayload.hasAction()) {
-                                    continue;
-                                }
-
-                                ProposalResponsePayload responsePayload = ProposalResponsePayload.parseFrom(
-                                        actionPayload.getAction().getProposalResponsePayload());
-                                ChaincodeAction chaincodeAction = ChaincodeAction
-                                        .parseFrom(responsePayload.getExtension());
-                                if (chaincodeAction.getEvents().isEmpty()) {
-                                    continue;
-                                }
-
-                                ChaincodeEvent event = ChaincodeEvent.parseFrom(chaincodeAction.getEvents());
-                                if (!runConfig.chaincodeName.equals(event.getChaincodeId())) {
-                                    continue;
-                                }
-                                if (!("SubmitOp::" + docId).equals(event.getEventName())) {
-                                    continue;
-                                }
-
-                                byte[] payloadBytes = event.getPayload().toByteArray();
-                                if (payloadBytes.length == 0) {
-                                    continue;
-                                }
-
-                                OperationRecord record = gson.fromJson(
-                                        new String(payloadBytes, StandardCharsets.UTF_8),
-                                        OperationRecord.class);
-                                if (record == null || record.getOperation() == null) {
-                                    continue;
-                                }
-
-                                Operation committed = record.getOperation();
-                                if (committed.getClientId() != null && committed.getClientId().equals(targetClientId)) {
-                                    continue;
-                                }
-                                initial.add(committed);
-                            }
-                        } catch (Exception e) {
-                            System.out.println("Block parse failed: " + e.getMessage());
-                        }
-                    }
+        // Prefer using in-memory committedHistory if available: reconstruct buffer
+        // from committedHistory and the ack carried in referenceOp.
+        if (committedHistory != null && !committedHistory.isEmpty()) {
+            long ackFromRef = referenceOp == null ? 0L : referenceOp.getAck();
+            int ackInt = normalizeAck(ackFromRef, committedHistory.size());
+            for (int i = ackInt; i < committedHistory.size(); i++) {
+                Operation committed = committedHistory.get(i);
+                if (committed.getClientId() != null && committed.getClientId().equals(targetClientId)) {
+                    continue;
                 }
+                initial.add(committed);
             }
-        } catch (Exception e) {
-            System.out.println("Failed to rebuild client buffer from ledger: " + e.getMessage());
         }
         return initial;
     }
@@ -1489,36 +1639,10 @@ public final class App {
                 && a.getClientId().equals(b.getClientId());
     }
 
-    private List<PendingOp> extractExpiredPendingOps() {
-        long cutoff = System.currentTimeMillis() - PENDING_OP_TTL_MS;
-        List<PendingOp> expired = new ArrayList<>();
-        pendingByClient.entrySet().removeIf(entry -> {
-            Map<Long, PendingOp> pending = entry.getValue();
-            if (!pending.isEmpty()) {
-                List<Long> keys = new ArrayList<>(pending.keySet());
-                keys.sort(Long::compareTo);
-                for (Long key : keys) {
-                    PendingOp op = pending.get(key);
-                    if (op != null && op.enqueueTimeMs < cutoff) {
-                        expired.add(op);
-                        pending.remove(key);
-                    }
-                }
-            }
-            return pending.isEmpty();
-        });
-        return expired;
-    }
-
     private List<Operation> collectOrderedOps(final Operation incoming, final int txIndex, final int actionIndex) {
         List<Operation> ordered = new ArrayList<>();
         if (incoming == null) {
             return ordered;
-        }
-
-        List<PendingOp> expired = extractExpiredPendingOps();
-        for (PendingOp op : expired) {
-            ordered.add(serverRecOne(op.op));
         }
 
         String senderId = incoming.getClientId();
@@ -1624,7 +1748,9 @@ public final class App {
             if (config == null) {
                 throw new IllegalArgumentException("Invalid config json: " + configPath);
             }
-            config.mode = "test";
+            if (config.mode == null || config.mode.isBlank()) {
+                config.mode = "test";
+            }
             Path baseDir = configPath.getParent();
             config.certDirPath = resolvePath(baseDir, config.certDirPath).toString();
             config.keyDirPath = resolvePath(baseDir, config.keyDirPath).toString();

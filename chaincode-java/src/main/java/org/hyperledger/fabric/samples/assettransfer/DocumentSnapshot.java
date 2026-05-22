@@ -48,6 +48,10 @@ public final class DocumentSnapshot {
     @Property()
     private final Map<String, Long> knownClients;
 
+
+    @Property()
+    private final List<Operation> committedHistory;
+
     public DocumentSnapshot(
             @JsonProperty("snapshotId") final String snapshotId,
             @JsonProperty("docId") final String docId,
@@ -59,7 +63,8 @@ public final class DocumentSnapshot {
             @JsonProperty("committedView") final String committedView,
             @JsonProperty("clientBuffers") final Map<String, List<Operation>> clientBuffers,
             @JsonProperty("pendingByClient") final Map<String, Map<Long, Operation>> pendingByClient,
-            @JsonProperty("knownClients") final Map<String, Long> knownClients) {
+            @JsonProperty("knownClients") final Map<String, Long> knownClients,
+            @JsonProperty("committedHistory") final List<Operation> committedHistory) {
         this.snapshotId = snapshotId;
         this.docId = docId;
         this.version = version;
@@ -71,6 +76,7 @@ public final class DocumentSnapshot {
         this.clientBuffers = clientBuffers;
         this.pendingByClient = pendingByClient;
         this.knownClients = knownClients;
+        this.committedHistory = committedHistory;
     }
 
     public String getSnapshotId() {
@@ -117,5 +123,9 @@ public final class DocumentSnapshot {
 
     public Map<String, Long> getKnownClients() {
         return knownClients;
+    }
+
+    public List<Operation> getCommittedHistory() {
+        return committedHistory;
     }
 }

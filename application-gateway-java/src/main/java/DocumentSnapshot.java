@@ -1,6 +1,5 @@
 import java.util.List;
 import java.util.Map;
-import java.util.Map;
 
 public final class DocumentSnapshot {
     public String snapshotId;
@@ -14,4 +13,5 @@ public final class DocumentSnapshot {
     public Map<String, List<Operation>> clientBuffers;
     public Map<String, Map<Long, Operation>> pendingByClient;
     public Map<String, Long> knownClients;
+    public List<Operation> committedHistory;
 }

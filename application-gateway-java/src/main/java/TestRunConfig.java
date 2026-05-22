@@ -14,6 +14,23 @@ public final class TestRunConfig {
     public List<String> values = new ArrayList<>();
     public long pollMillis = 300;
     public long testTimeoutSeconds = 600;
+    public long startupDelayMs = 0;
+    public long snapshotIntervalMs = 60_000L;
+    public boolean snapshotEnabled = true;
+
+    public long experimentDurationMs = 300_000L;
+    public String opTimingMode = "poisson";
+    public long opTimingMeanMs = 1_000L;
+    public long opTimingWindowMs = 5_000L;
+    public int opBurstSize = 3;
+    public long opBurstGapMs = 5_000L;
+    public long opBurstJitterMs = 200L;
+    public long opTimingSeed = 0L;
+    public long realtimeDrainTimeoutMs = 30_000L;
+    public long realtimePollMillis = 100L;
+
+    public boolean metricsEnabled = false;
+    public String metricsOutputPath = "test-configs/generated/metrics.csv";
 
     public String mspId = "Org1MSP";
     public String certDirPath;
@@ -26,6 +43,14 @@ public final class TestRunConfig {
 
     public boolean isTestMode() {
         return "test".equalsIgnoreCase(mode);
+    }
+
+    public boolean isRealtimeMode() {
+        return "realtime".equalsIgnoreCase(mode);
+    }
+
+    public boolean isAutomatedMode() {
+        return isTestMode() || isRealtimeMode();
     }
 
     public Connections.GatewayProfile toGatewayProfile() {
