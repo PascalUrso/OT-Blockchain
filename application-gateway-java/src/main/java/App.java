@@ -44,7 +44,6 @@ import java.util.Random;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -199,7 +198,7 @@ public final class App {
      * transformation.
      * Used to initialise the per-client buffers of late-joining peers.
      */
-    private final List<Operation> committedHistory = new CopyOnWriteArrayList<>();
+    private final List<Operation> committedHistory = new ArrayList<>();
 
     /**
      * Per-client "outstanding" buffers: for a given sender, the buffer holds the
@@ -218,10 +217,8 @@ public final class App {
 
     /**
      * Operations staged locally but not yet confirmed on-chain.
-     * CopyOnWriteArrayList allows the block-listener thread to iterate safely while
-     * the main thread modifies the list.
      */
-    private final List<Operation> localPending = new CopyOnWriteArrayList<>();
+    private final List<Operation> localPending = new ArrayList<>();
 
     /**
      * IDs of operations already submitted to the Fabric network (transaction sent)
