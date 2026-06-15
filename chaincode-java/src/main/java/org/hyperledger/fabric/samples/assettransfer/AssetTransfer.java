@@ -185,7 +185,7 @@ public final class AssetTransfer implements ContractInterface {
             }
         }
         stub.putStringState(snapshotKey, genson.serialize(snapshot));
-        stub.setEvent("SaveSnapshot", genson.serializeBytes(snapshot));
+        // stub.setEvent("SaveSnapshot", genson.serializeBytes(snapshot));
         return snapshotKey;
     }
 

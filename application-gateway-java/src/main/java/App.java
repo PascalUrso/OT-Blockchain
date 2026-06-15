@@ -86,7 +86,7 @@ public final class App {
     private static final String REPLAY_LOG_ARG = "--replay-log";
 
     /** Parameters of creating snapshots. */
-    private static final int SNAPSHOT_TRIGGER_OPS = 100;
+    private static final int SNAPSHOT_TRIGGER_OPS = 100000;
     private static final long SNAPSHOT_TRIGGER_MS = 60_000L;
     private static final int SNAPSHOT_CHUNK_SIZE = 900_000;
     private static final long PENDING_OP_TTL_MS = 60_000L;
@@ -234,9 +234,6 @@ public final class App {
 
     /** True after the first submitted operation has carried the cursor metadata. */
     private boolean cursorAttachedToLedger;
-
-    /** Next sequence number to assign for this client. */
-    private long localSeq;
 
     /** Buffer for out-of-order ops by client sequence. */
     private final Map<String, Map<Long, PendingOp>> pendingByClient = new HashMap<>();
@@ -526,10 +523,9 @@ public final class App {
 
         int totalOps = runConfig.totalOps;
         long deadline = System.currentTimeMillis() + timeoutSeconds * 1000;
-        long N = totalOps+lastSyncedVersion;
         submitScheduledOpsAtClock(localClock);
         // Wait until the ledger has committed all expected operations (or timeout).
-        while (lastSyncedVersion < N) {
+        while (lastSyncedVersion < totalOps) {
             if (System.currentTimeMillis() > deadline) {
                 System.out.println(
                         "Test mode timed out waiting for " + totalOps + " ops (got " + lastSyncedVersion + ")");
@@ -672,7 +668,6 @@ public final class App {
             // Document was already created by another client — nothing to do.
         }
         localAck = 0;
-        localSeq = queryClientSeqFromWorldState();
         localClock = 0;
         cursorAttachedToLedger = false;
         localPending.clear();
@@ -999,7 +994,7 @@ public final class App {
                 System.out.println("Failed to read client seq: " + e.getMessage());
                 return;
             }
-
+            Operation candidateForSubmit;
             synchronized (stateLock) {
                 candidate = getNextUnsubmittedPending();
                 if (candidate == null) {
@@ -1009,29 +1004,33 @@ public final class App {
                 ackSnapshot = localAck;
                 includeCursor = !cursorAttachedToLedger;
 
-                Operation candidateForSubmit = withAckAndSeq(candidate, ackSnapshot, seq, includeCursor);
+                candidateForSubmit = withAckAndSeq(candidate, ackSnapshot, seq, includeCursor);
+                long[] _m_start = metrics.start();
+                submittedPendingOpIds.add(candidateForSubmit.getOpId());
+                // Reset ack after a successful submission.
+                localAck = 0;
+                cursorAttachedToLedger = true;
+                metrics.end("op", "submit", candidateForSubmit.getOpId(), _m_start);
+            }
+            try {
+                long[] _m_start = metrics.start();
+                contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
+                metrics.end("op", "submitcommunication", candidateForSubmit.getOpId(), _m_start);
 
-                try {
-                    long[] _m_start = metrics.start();
-                    contract.submitTransaction("SubmitOp", docId, gson.toJson(candidateForSubmit));
-                    metrics.end("op", "submit", candidateForSubmit.getOpId(), _m_start);
-                    submittedPendingOpIds.add(candidateForSubmit.getOpId());
-                    // Reset ack after a successful submission.
-                    localAck = 0;
-                    cursorAttachedToLedger = true;
-                    localSeq = seq + 1;
-                    System.out.println(
-                            "Tx successfully sent, op_id=" + candidateForSubmit.getOpId() + ", ack=" + ackSnapshot);
-                    return;
-                } catch (Exception e) {
-                    if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
-                        System.out.println("MVCC conflict detected, syncing and retrying (" + attempt + "/"
-                                + MAX_SUBMIT_RETRIES + ")");
-                        manualEventSync();
-                        lastError = e;
-                    }
+                System.out.println(
+                        "Tx successfully sent, op_id=" + candidateForSubmit.getOpId() + ", ack=" + ackSnapshot);
+                return;
+            } catch (Exception e) {
+                submittedPendingOpIds.remove(candidateForSubmit.getOpId());
+                localAck += ackSnapshot;
+                if (isMvccConflict(e) && attempt < MAX_SUBMIT_RETRIES) {
+                    System.out.println("MVCC conflict detected, syncing and retrying (" + attempt + "/"
+                            + MAX_SUBMIT_RETRIES + ")");
+                    manualEventSync();
+                    lastError = e;
                 }
             }
+            
         }
         if (lastError != null) {
             System.out.println("Submit failed: " + lastError.getMessage());
@@ -1332,7 +1331,6 @@ public final class App {
 
         chainState = new DocumentState(docId, committedView, lastSyncedVersion);
         clientRec(orderedOps);
-        //tryCreateSnapshot();
         System.out.println("Synced from block=" + blockNumber
             + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
         if(chainState.getVersion() % 10 == 0) {
@@ -1406,17 +1404,11 @@ public final class App {
         if (runConfig != null && !runConfig.snapshotEnabled) {
             return;
         }
-        if (!localPending.isEmpty()) {
-            return;
-        }
 
         long now = System.currentTimeMillis();
         long opsSinceSnapshot = lastSyncedVersion - lastSnapshotVersion;
         boolean opsTrigger = opsSinceSnapshot >= SNAPSHOT_TRIGGER_OPS;
         boolean timeTrigger = (now - lastSnapshotTimeMs) >= nextSnapshotIntervalMs;
-        System.out.println("opsTrigger=" + opsTrigger + ", timeTrigger=" + timeTrigger + ", now=" + now
-                + ", lastSnapshotTimeMs=" + lastSnapshotTimeMs + ", nextSnapshotIntervalMs="
-                + nextSnapshotIntervalMs);
         if ((opsTrigger || timeTrigger) && lastSyncedVersion > lastSnapshotVersion) {
             try {
                 saveSnapshotToChain();
@@ -1500,8 +1492,8 @@ public final class App {
     private long sampleSnapshotIntervalMs() {
         long mean = runConfig != null && runConfig.snapshotIntervalMs > 0 ? runConfig.snapshotIntervalMs
                 : SNAPSHOT_TRIGGER_MS;
-        long min = Math.max(1L, Math.round(mean * 0.9d));
-        long max = Math.max(min, Math.round(mean * 1.1d));
+        long min = Math.max(1L, Math.round(mean * 0.8d));
+        long max = Math.max(min, Math.round(mean * 1.2d));
         double sigma = Math.max(1.0d, mean * 0.1d);
         long sampled = Math.round(mean + random.nextGaussian() * sigma);
         return Math.max(min, Math.min(max, sampled));
@@ -1651,10 +1643,6 @@ public final class App {
         }
 
         long seq = incoming.getClientSeq();
-        if (seq < 0) {
-            ordered.add(serverRecOne(incoming));
-            return ordered;
-        }
 
         long expected = knownClients.getOrDefault(senderId, 0L);
         if (seq > expected) {
@@ -1664,9 +1652,7 @@ public final class App {
             return ordered;
         }
 
-        if (seq < expected) {
-            return ordered;
-        }
+
 
         Map<Long, PendingOp> pending = pendingByClient.computeIfAbsent(senderId, id -> new HashMap<>());
         PendingOp current = new PendingOp(incoming);

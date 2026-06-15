@@ -90,8 +90,10 @@ The client prompts for a `client_id` and a `doc_id`, then enters an interactive 
 ## Key Design Decisions
 
 - **No central OT server** — the blockchain acts as the ordered log; OT convergence is computed client-side.
-- **MVCC conflict handling** — on `MVCC_READ_CONFLICT`, the client re-syncs from the chain and retries the submission (up to `MAX_SUBMIT_RETRIES = 3` times).
+
 - **Ack-based buffer trimming** — each submitted operation carries an `ack` counter so the server-side buffer for the sender can be trimmed, keeping the OT state compact.
+
+- **Snapshot machanism** -- each client starts with resuming from a snapshot and submits snapshot to chain with a set rate. 
 
 ## License
 
