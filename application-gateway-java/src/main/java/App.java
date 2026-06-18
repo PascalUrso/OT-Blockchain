@@ -1235,7 +1235,7 @@ public final class App {
         for (Operation op : transformedBlockOps) {
             localClock++;
 
-            if (!localPending.isEmpty() && op.getClientId().equals(clientId)) {
+            if (!localPending.isEmpty() && op.getClientId().equals(clientId) && op.getOpId().equals(localPending.get(0).getOpId())) {
                 // This committed op is our own: the first pending entry is confirmed.
                 synchronized (stateLock) {
                     localPending.subList(0, 1).clear();
@@ -1363,7 +1363,7 @@ public final class App {
 
         // Trim the sender's buffer: the ack value tells us how many remote ops
         // the sender had already seen when it produced this operation.
-        List<Operation> senderBuffer = getClientBuffer(senderId, incomingRaw);
+        List<Operation> senderBuffer = getClientBuffer(senderId);
         int ack = normalizeAck(incomingRaw.getAck(), senderBuffer.size());
         if (ack > 0) {
             senderBuffer.subList(0, ack).clear();
@@ -1512,25 +1512,20 @@ public final class App {
     // -------------------------------------------------------------------------
 
     private List<Operation> getClientBuffer(final String targetClientId) {
-        return clientBuffers.computeIfAbsent(targetClientId, id -> buildInitialBufferForClient(id, null));
+        return clientBuffers.computeIfAbsent(targetClientId, id -> buildInitialBufferForClient(id));
     }
 
-    private List<Operation> getClientBuffer(final String targetClientId, final Operation referenceOp) {
-        return clientBuffers.computeIfAbsent(targetClientId, id -> buildInitialBufferForClient(id, referenceOp));
-    }
 
     /**
      * Builds an initial buffer for a newly-seen client by reloading ledger ops
      * after the cursor stored in the first submitted op.
      */
-    private List<Operation> buildInitialBufferForClient(final String targetClientId, final Operation referenceOp) {
+    private List<Operation> buildInitialBufferForClient(final String targetClientId) {
         List<Operation> initial = new ArrayList<>();
         // Prefer using in-memory committedHistory if available: reconstruct buffer
         // from committedHistory and the ack carried in referenceOp.
         if (committedHistory != null && !committedHistory.isEmpty()) {
-            long ackFromRef = referenceOp == null ? 0L : referenceOp.getAck();
-            int ackInt = normalizeAck(ackFromRef, committedHistory.size());
-            for (int i = ackInt; i < committedHistory.size(); i++) {
+            for (int i = 0; i < committedHistory.size(); i++) {
                 Operation committed = committedHistory.get(i);
                 if (committed.getClientId() != null && committed.getClientId().equals(targetClientId)) {
                     continue;
@@ -1540,6 +1535,7 @@ public final class App {
         }
         return initial;
     }
+
 
     /**
      * Returns a copy of {@code op} with the given {@code ack} and {@code clientSeq}
