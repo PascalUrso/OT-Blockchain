@@ -6,6 +6,8 @@ package org.hyperledger.fabric.samples.assettransfer;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 import org.hyperledger.fabric.contract.Context;
 import org.hyperledger.fabric.contract.ContractInterface;
@@ -68,7 +70,7 @@ public final class AssetTransfer implements ContractInterface {
     }
 
     @Transaction(intent = Transaction.TYPE.SUBMIT)
-    public OperationRecord SubmitOp(final Context ctx, final String docId, final String opJson) {
+    public String SubmitOp(final Context ctx, final String docId, final String opJson) {
         ChaincodeStub stub = ctx.getStub();
         String snapKey = snapKey(docId);
         String snapJson = stub.getStringState(snapKey);
@@ -90,7 +92,7 @@ public final class AssetTransfer implements ContractInterface {
         String seqKey = clientSeqKey(docId, op.getClientId());
         long currentSeq = parseLongOrDefault(stub.getStringState(seqKey), 0L);
         if (op.getClientSeq() < 0) {
-            throw new ChaincodeException("clientSeq is required", OTCollabErrors.INVALID_OPERATION.toString());
+            throw new ChaincodeException("clientSeq is required" + opJson, OTCollabErrors.INVALID_OPERATION.toString());
         }
         if (op.getClientSeq() < currentSeq) {
             throw new ChaincodeException("clientSeq out of date", OTCollabErrors.INVALID_OPERATION.toString());
@@ -101,28 +103,25 @@ public final class AssetTransfer implements ContractInterface {
         // Do not read operation range here to avoid PHANTOM_READ_CONFLICT under concurrent submits.
         // Ordering and transform are handled client-side per committed block.
         long committedOrder = op.getTimestamp();
-        if (stub.getTxTimestamp() != null) {
-            committedOrder = stub.getTxTimestamp().getEpochSecond() * 1_000_000_000L + stub.getTxTimestamp().getNano();
-        }
-        Operation committedOp = new Operation(
-            op.getOpId(),
-            op.getClientId(),
-            op.getType(),
-            op.getPosition(),
-            op.getValue(),
-            op.getTimestamp(),
-            op.getAck(),
-            op.getClientSeq(),
-            -1L,
-            -1,
-            -1);
-        OperationRecord record = new OperationRecord(docId, committedOp, committedOrder, stub.getTxId());
+
+        OperationRecord record = new OperationRecord(docId, op, committedOrder, stub.getTxId());
 
         // Write to operation log (append-only key, no shared-key write conflict)
         stub.putStringState(logKey(docId, committedOrder, stub.getTxId(), op.getOpId()), genson.serialize(record));
         stub.setEvent("SubmitOp::" + docId, genson.serializeBytes(record));
 
-        return record;
+        Map<String, Object> responseMap = new TreeMap<>();
+        responseMap.put("committedVersion", committedOrder);
+        responseMap.put("txId", stub.getTxId());
+        responseMap.put("docId", docId);
+        responseMap.put("opId", op.getOpId());
+        responseMap.put("opType", op.getType());
+        responseMap.put("opSeq", op.getClientSeq());
+        responseMap.put("opValue", op.getValue());
+        responseMap.put("opPosition", op.getPosition());
+        responseMap.put("opAck", op.getAck());
+        responseMap.put("opClientId", op.getClientId());
+        return genson.serialize(responseMap);
     }
 
     @Transaction(intent = Transaction.TYPE.EVALUATE)
@@ -278,6 +277,21 @@ public final class AssetTransfer implements ContractInterface {
     }
 
     @Transaction(intent = Transaction.TYPE.EVALUATE)
+    public long SumClientSeqs(final Context ctx, final String docId) {
+        ChaincodeStub stub = ctx.getStub();
+        String marker = stub.getStringState(snapKey(docId));
+        if (marker == null || marker.isEmpty()) {
+            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
+        }
+
+        long sum = 0;
+        for (KeyValue kv : stub.getStateByRange(clientSeqPrefix(docId), clientSeqPrefixEnd(docId))) {
+            sum += parseLongOrDefault(kv.getStringValue(), 0L);
+        }
+        return sum;
+    }
+
+    @Transaction(intent = Transaction.TYPE.EVALUATE)
     public String GetClientSeq(final Context ctx, final String docId, final String clientId) {
         ChaincodeStub stub = ctx.getStub();
         String marker = stub.getStringState(snapKey(docId));
@@ -310,6 +324,14 @@ public final class AssetTransfer implements ContractInterface {
 
     private String clientSeqKey(final String docId, final String clientId) {
         return String.format("%s%s::%s", CLIENT_SEQ_PREFIX, docId, clientId);
+    }
+
+    private String clientSeqPrefix(final String docId) {
+        return String.format("%s%s::", CLIENT_SEQ_PREFIX, docId);
+    }
+
+    private String clientSeqPrefixEnd(final String docId) {
+        return String.format("%s%s::\uffff", CLIENT_SEQ_PREFIX, docId);
     }
 
     private long parseLongOrDefault(final String value, final long fallback) {
