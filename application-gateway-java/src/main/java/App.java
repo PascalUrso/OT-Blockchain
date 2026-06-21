@@ -44,6 +44,8 @@ import java.util.Random;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -238,6 +240,11 @@ public final class App {
     /** Optional metrics sink for test runs. */
     private final MetricsRecorder metrics;
 
+    private final CompletableFuture<Void> readySignal = new CompletableFuture<>();
+    private volatile boolean ready = false;
+    private boolean receiveStarted = false;
+    private long readyNum;
+    long[] readyTimeReceive;
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -444,6 +451,12 @@ public final class App {
         } finally {
             metrics.end("startup", "bootstrap", clientId == null ? "" : clientId, _m_start);
         }
+        try {
+            readySignal.get(); 
+        } catch (ExecutionException e) {
+            Thread.currentThread().interrupt();
+        }
+        localAck = getClientBuffer(clientId).size();
 
         if (testMode) {
             runTestMode();
@@ -664,6 +677,13 @@ public final class App {
         } catch (Exception e) {
             // Document was already created by another client — nothing to do.
         }
+
+        long[] readyTime = metrics.start();
+        readyNum = queryTotalNumOpsFromWorldState();
+        if(readyNum == 0){
+            ready = true;
+            readySignal.complete(null); 
+        }
         localAck = 0;
         localClock = 0;
         cursorAttachedToLedger = false;
@@ -685,6 +705,7 @@ public final class App {
             rebuildCommittedFromLedger();
             resetSnapshotTimer(System.currentTimeMillis());
         }
+        metrics.end("startup", "getreadyPart1", String.valueOf(lastSyncedVersion), readyTime);
         
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
@@ -705,7 +726,6 @@ public final class App {
             committedView = snapshot.committedView;
             localView = committedView;
             lastSyncedVersion = snapshot.version;
-            localAck = snapshot.version;
             chainState = new DocumentState(docId, committedView, lastSyncedVersion);
             lastSnapshotVersion = snapshot.version;
             lastSnapshotTimeMs = System.currentTimeMillis();
@@ -825,6 +845,10 @@ public final class App {
     }
 
     private void processBlock(final Block block) {
+        if(!receiveStarted && !ready){
+            receiveStarted = true;
+            readyTimeReceive = metrics.start();
+        }
         if (block == null) {
             return;
         }
@@ -1332,6 +1356,11 @@ public final class App {
             + ", version=" + chainState.getVersion() + ", opId=" + record.getOperation().getOpId());
         if(chainState.getVersion() % 10 == 0) {
             printStatus();
+        }
+        if(!ready && lastSyncedVersion >= readyNum) {
+            ready = true;
+            readySignal.complete(null);
+            metrics.end("startup", "getreadyPart2", String.valueOf(lastSyncedVersion), readyTimeReceive);
         }
         metrics.end("op", "receive", record != null && record.getOperation() != null ? record.getOperation().getOpId() : "", _m_start);
     }
