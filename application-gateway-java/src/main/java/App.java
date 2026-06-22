@@ -456,6 +456,7 @@ public final class App {
         } catch (ExecutionException e) {
             Thread.currentThread().interrupt();
         }
+        resetSnapshotTimer(System.currentTimeMillis());
         localAck = getClientBuffer(clientId).size();
 
         if (testMode) {
@@ -671,19 +672,22 @@ public final class App {
      * If the document already exists (another client got there first) the
      * InitDoc transaction will throw — that exception is silently ignored.
      */
-    private void bootstrap() throws Exception {
+        private void bootstrap() throws Exception {
         try {
-            contract.submitTransaction("InitDoc", docId, "");
+            contract.evaluateTransaction("QueryState", docId);
         } catch (Exception e) {
-            // Document was already created by another client — nothing to do.
+            // Document was not created by another client, create it.
+            try{
+                contract.submitTransaction("InitDoc", docId, "");
+            } catch (Exception e2) {
+                // Ignore exception, as the document might have been created by another client.
+            }
         }
 
         long[] readyTime = metrics.start();
         readyNum = queryTotalNumOpsFromWorldState();
-        if(readyNum == 0){
-            ready = true;
-            readySignal.complete(null); 
-        }
+        System.out.println("Total number of ops in world state: " + readyNum);
+
         localAck = 0;
         localClock = 0;
         cursorAttachedToLedger = false;
@@ -698,19 +702,24 @@ public final class App {
             localView = committedView;
             knownClients.clear();
             knownClients.put(clientId, 0L);
-
             clientBuffers.clear();
             clientBuffers.put(clientId, new ArrayList<>());
             lastEventBlock = 0;
-            rebuildCommittedFromLedger();
-            resetSnapshotTimer(System.currentTimeMillis());
+            localPending.clear();
+            submittedPendingOpIds.clear();
+            lastSyncedVersion = 0;
+            lastEventTxIndex = -1;
+            lastEventActionIndex = -1;
+        }
+        if(lastSyncedVersion >= readyNum){
+            ready = true;
+            readySignal.complete(null);
         }
         metrics.end("startup", "getreadyPart1", String.valueOf(lastSyncedVersion), readyTime);
         
         System.out.println(
                 "Initialized: version=" + chainState.getVersion() + ", content='" + chainState.getContent() + "'");
     }
-
     /**
      * loadSnapshotFromChain
      * Called once on startup.
@@ -733,7 +742,10 @@ public final class App {
             lastEventBlock = snapshot.lastBlockNumber;
             lastEventTxIndex = snapshot.lastEventTxIndex;
             lastEventActionIndex = snapshot.lastEventActionIndex;
-
+            committedHistory.clear();
+            if (snapshot.committedHistory != null) {
+                committedHistory.addAll(snapshot.committedHistory);
+            }
             knownClients.clear();
             if (snapshot.knownClients != null) {
                 knownClients.putAll(snapshot.knownClients);
@@ -744,7 +756,7 @@ public final class App {
             if (snapshot.clientBuffers != null) {
                 clientBuffers.putAll(snapshot.clientBuffers);
             }
-            clientBuffers.putIfAbsent(clientId, new ArrayList<>());
+            clientBuffers.putIfAbsent(clientId, new ArrayList<>(committedHistory));
 
             pendingByClient.clear();
             if (snapshot.pendingByClient != null) {
@@ -761,10 +773,6 @@ public final class App {
                     if (!pending.isEmpty()) {
                         pendingByClient.put(entry.getKey(), pending);
                     }
-                }
-                committedHistory.clear();
-                if (snapshot.committedHistory != null) {
-                    committedHistory.addAll(snapshot.committedHistory);
                 }
             }
             localView = committedView;
@@ -787,25 +795,6 @@ public final class App {
             return null;
         }
         return gson.fromJson(json, DocumentSnapshot.class);
-    }
-
-    /**
-     * Resets all local OT state and replays the full operation log from the ledger.
-     * Called once on startup and can be triggered manually for a hard resync.
-     */
-    private void rebuildCommittedFromLedger() throws Exception {
-        committedView = "";
-        localPending.clear();
-        submittedPendingOpIds.clear();
-        // lastLogCursorKey removed; no-op
-        lastSyncedVersion = 0;
-        chainState = new DocumentState(docId, committedView, lastSyncedVersion);
-        lastEventTxIndex = -1;
-        lastEventActionIndex = -1;
-
-        if (!eventListenerStarted) {
-            startBlockListener();
-        }
     }
 
     // -------------------------------------------------------------------------
