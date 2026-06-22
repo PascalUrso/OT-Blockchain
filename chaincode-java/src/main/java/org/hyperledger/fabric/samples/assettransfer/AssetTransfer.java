@@ -107,7 +107,6 @@ public final class AssetTransfer implements ContractInterface {
         OperationRecord record = new OperationRecord(docId, op, committedOrder, stub.getTxId());
 
         // Write to operation log (append-only key, no shared-key write conflict)
-        stub.putStringState(logKey(docId, committedOrder, stub.getTxId(), op.getOpId()), genson.serialize(record));
         stub.setEvent("SubmitOp::" + docId, genson.serializeBytes(record));
 
         Map<String, Object> responseMap = new TreeMap<>();
@@ -140,25 +139,6 @@ public final class AssetTransfer implements ContractInterface {
         return new Asset(docId, "", version);
     }
 
-    @Transaction(intent = Transaction.TYPE.EVALUATE)
-    public String QueryAllOps(final Context ctx, final String docId) {
-        String marker = ctx.getStub().getStringState(snapKey(docId));
-        if (marker == null || marker.isEmpty()) {
-            throw new ChaincodeException("Document does not exist: " + docId, OTCollabErrors.DOC_NOT_FOUND.toString());
-        }
-
-        ChaincodeStub stub = ctx.getStub();
-        String startKey = logPrefix(docId);
-        String endKey = logPrefixEnd(docId);
-
-        List<OperationRecord> ops = new ArrayList<>();
-        for (KeyValue kv : stub.getStateByRange(startKey, endKey)) {
-            ops.add(genson.deserialize(kv.getStringValue(), OperationRecord.class));
-        }
-
-        return genson.serialize(ops);
-    }
-    
     @Transaction(intent = Transaction.TYPE.SUBMIT)
     public String SaveSnapshot(final Context ctx, final String docId, final String snapshotJson) {
         ChaincodeStub stub = ctx.getStub();
@@ -345,16 +325,4 @@ public final class AssetTransfer implements ContractInterface {
         }
     }
 
-    private String logKey(final String docId, final long submittedTs, final String txId, final String opId) {
-        return String.format("%s%s::%020d::%s::%s", LOG_PREFIX, docId, submittedTs,
-                txId == null ? "" : txId, opId == null ? "" : opId);
-    }
-
-    private String logPrefix(final String docId) {
-        return String.format("%s%s::", LOG_PREFIX, docId);
-    }
-
-    private String logPrefixEnd(final String docId) {
-        return String.format("%s%s::\uffff", LOG_PREFIX, docId);
-    }
 }
