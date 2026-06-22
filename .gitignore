@@ -33,6 +33,6 @@ hs_err_pid*
 
 # Logs
 *.log
-
+logs/
 # Hyperledger Fabric connection profiles (may contain secrets)
 application-gateway-java/src/main/resources/crypto-config/

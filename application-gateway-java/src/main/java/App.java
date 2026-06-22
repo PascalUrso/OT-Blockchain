@@ -231,9 +231,6 @@ public final class App {
     /** True once the chaincode event listener has started. */
     private volatile boolean eventListenerStarted;
 
-    /** True after the first submitted operation has carried the cursor metadata. */
-    private boolean cursorAttachedToLedger;
-
     /** Buffer for out-of-order ops by client sequence. */
     private final Map<String, Map<Long, PendingOp>> pendingByClient = new HashMap<>();
 
@@ -475,7 +472,7 @@ public final class App {
             System.out.println("\n1) INSERT(local pending)  2) DELETE(local pending)  3) UPDATE(local pending)");
             System.out.println(
                     "4) submit 1 local pending  5) submit all local pending  6) manually sync with chain and save snapshot");
-            System.out.println("7) view all committed ops  8) exit");
+            System.out.println("8) exit");
             System.out.print("select: ");
             if (!scanner.hasNextLine()) {
                 return;
@@ -504,13 +501,6 @@ public final class App {
                         resetSnapshotTimer(System.currentTimeMillis());
                     } catch (Exception e) {
                         System.out.println("Snapshot save failed: " + e.getMessage());
-                    }
-                    break;
-                case "7":
-                    List<OperationRecord> allOps = queryAllOps();
-                    System.out.println("All committed ops from ledger:");
-                    for (OperationRecord record : allOps) {
-                        System.out.println(gson.toJson(record));
                     }
                     break;
                 case "8":
@@ -690,7 +680,6 @@ public final class App {
 
         localAck = 0;
         localClock = 0;
-        cursorAttachedToLedger = false;
         localPending.clear();
         submittedPendingOpIds.clear();
         
@@ -995,7 +984,6 @@ public final class App {
         for (int attempt = 1; attempt <= MAX_SUBMIT_RETRIES; attempt++) {
             Operation candidate;
             long ackSnapshot;
-            boolean includeCursor;
 
             long seq;
             try {
@@ -1012,14 +1000,12 @@ public final class App {
                     return;
                 }
                 ackSnapshot = localAck;
-                includeCursor = !cursorAttachedToLedger;
 
-                candidateForSubmit = withAckAndSeq(candidate, ackSnapshot, seq, includeCursor);
+                candidateForSubmit = withAckAndSeq(candidate, ackSnapshot, seq);
                 long[] _m_start = metrics.start();
                 submittedPendingOpIds.add(candidateForSubmit.getOpId());
                 // Reset ack after a successful submission.
                 localAck = 0;
-                cursorAttachedToLedger = true;
                 metrics.end("op", "submit", candidateForSubmit.getOpId(), _m_start);
             }
             try {
@@ -1559,35 +1545,18 @@ public final class App {
      * Returns a copy of {@code op} with the given {@code ack} and {@code clientSeq}
      * attached.
      */
-    private Operation withAckAndSeq(final Operation op, final long ack, final long clientSeq,
-            final boolean includeCursor) {
-        if (includeCursor) {
-            return new Operation(
-                    op.getOpId(),
-                    op.getClientId(),
-                    op.getType(),
-                    op.getPosition(),
-                    op.getValue(),
-                    op.getTimestamp(),
-                    ack,
-                    clientSeq,
-                    lastEventBlock,
-                    lastEventTxIndex,
-                    lastEventActionIndex);
-        } else {
-            return new Operation(
-                    op.getOpId(),
-                    op.getClientId(),
-                    op.getType(),
-                    op.getPosition(),
-                    op.getValue(),
-                    op.getTimestamp(),
-                    ack,
-                    clientSeq,
-                    -1L,
-                    -1,
-                    -1);
-        }
+    private Operation withAckAndSeq(final Operation op, final long ack, final long clientSeq) {
+        
+        return new Operation(
+                op.getOpId(),
+                op.getClientId(),
+                op.getType(),
+                op.getPosition(),
+                op.getValue(),
+                op.getTimestamp(),
+                ack,
+                clientSeq);
+        
     }
 
     /**
@@ -1636,11 +1605,6 @@ public final class App {
         return value == null || value.isBlank() ? fallback : value.trim();
     }
 
-    private boolean sameClient(final Operation a, final Operation b) {
-        return a != null && b != null
-                && a.getClientId() != null
-                && a.getClientId().equals(b.getClientId());
-    }
 
     private List<Operation> collectOrderedOps(final Operation incoming, final int txIndex, final int actionIndex) {
         List<Operation> ordered = new ArrayList<>();

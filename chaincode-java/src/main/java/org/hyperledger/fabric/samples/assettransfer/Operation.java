@@ -35,14 +35,6 @@ public final class Operation {
     @Property()
     private final long timestamp;
 
-    @Property()
-    private final long lastEventBlock;
-
-    @Property()
-    private final int lastEventTxIndex;
-
-    @Property()
-    private final int lastEventActionIndex;
 
 
     public Operation(
@@ -53,10 +45,7 @@ public final class Operation {
             @JsonProperty("value") final String value,
             @JsonProperty("timestamp") final long timestamp,
             @JsonProperty("ack") final long ack,
-            @JsonProperty("clientSeq") final long clientSeq,
-            @JsonProperty("lastEventBlock") final long lastEventBlock,
-            @JsonProperty("lastEventTxIndex") final int lastEventTxIndex,
-            @JsonProperty("lastEventActionIndex") final int lastEventActionIndex) {
+            @JsonProperty("clientSeq") final long clientSeq) {
         this.opId = opId;
         this.clientId = clientId;
         this.type = type;
@@ -65,9 +54,6 @@ public final class Operation {
         this.ack = ack;
         this.clientSeq = clientSeq;
         this.timestamp = timestamp;
-        this.lastEventBlock = lastEventBlock;
-        this.lastEventTxIndex = lastEventTxIndex;
-        this.lastEventActionIndex = lastEventActionIndex;
     }
 
     public String getOpId() {
@@ -100,17 +86,5 @@ public final class Operation {
 
     public long getTimestamp() {
         return timestamp;
-    }
-
-    public long getLastEventBlock() {
-        return lastEventBlock;
-    }
-
-    public int getLastEventTxIndex() {
-        return lastEventTxIndex;
-    }
-
-    public int getLastEventActionIndex() {
-        return lastEventActionIndex;
     }
 }
